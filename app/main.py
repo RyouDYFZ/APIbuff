@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 
 from .config import API_KEY
 from .pool import global_pool
-from .routes import chat, models, health, system
+from .routes import chat, models, health, system, accounts
 
 # Configure logging
 logging.basicConfig(
@@ -101,3 +101,4 @@ app.include_router(health.router)
 app.include_router(models.router)
 app.include_router(chat.router)
 app.include_router(system.router)
+app.include_router(accounts.router)

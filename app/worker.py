@@ -45,8 +45,19 @@ from .exceptions import (
 logger = logging.getLogger("freebuff.worker")
 
 class FreebuffWorker:
-    def __init__(self, workdir: str = WORKER_WORKDIR):
+    def __init__(
+        self,
+        workdir: str = WORKER_WORKDIR,
+        account_id: str = "default",
+        token: Optional[str] = None,
+        proxy_url: Optional[str] = None,
+        home_dir: Optional[str] = None
+    ):
         self.workdir = workdir
+        self.account_id = account_id
+        self.token = token
+        self.proxy_url = proxy_url
+        self.home_dir = home_dir or os.path.expanduser(f"~/.freebuff_accounts/{account_id}")
         self.project_basename = os.path.basename(os.path.abspath(workdir))
         self.master_fd: Optional[int] = None
         self.pid: Optional[int] = None
@@ -106,7 +117,7 @@ class FreebuffWorker:
 
     def prune_old_chats(self, keep: int = 25):
         """Prunes older chat directories in ~/.config/manicode/projects/<basename>/chats/ to prevent disk bloat."""
-        pattern = os.path.expanduser(f"~/.config/manicode/projects/{self.project_basename}/chats/*")
+        pattern = os.path.join(self.home_dir, f".config/manicode/projects/{self.project_basename}/chats/*")
         dirs = sorted(glob.glob(pattern), key=os.path.getmtime)
         if len(dirs) > keep:
             to_remove = dirs[:-keep]
@@ -125,6 +136,20 @@ class FreebuffWorker:
         Guarantees process chain shows p=shell, eliminating p=python completely.
         """
         os.makedirs(self.workdir, exist_ok=True)
+        os.makedirs(self.home_dir, exist_ok=True)
+
+        # Seed isolated account token if provided
+        if self.token:
+            creds_dir = os.path.join(self.home_dir, ".config", "manicode")
+            os.makedirs(creds_dir, exist_ok=True)
+            creds_file = os.path.join(creds_dir, "credentials.json")
+            if not os.path.exists(creds_file):
+                try:
+                    with open(creds_file, "w") as f:
+                        json.dump({"accessToken": self.token, "tokenStore": "file"}, f, indent=2)
+                except Exception as e:
+                    logger.debug(f"Failed to seed credentials in {creds_file}: {e}")
+
         self._ensure_git_repo()
         self.prune_old_chats(keep=25)
         self._loop = asyncio.get_running_loop()
@@ -145,6 +170,16 @@ class FreebuffWorker:
 
         # Prepare authentic terminal environment (Section IV)
         env = get_standard_terminal_env()
+        if self.home_dir:
+            env["HOME"] = self.home_dir
+
+        if self.proxy_url:
+            env["HTTP_PROXY"] = self.proxy_url
+            env["HTTPS_PROXY"] = self.proxy_url
+            env["ALL_PROXY"] = self.proxy_url
+            env["http_proxy"] = self.proxy_url
+            env["https_proxy"] = self.proxy_url
+            env["all_proxy"] = self.proxy_url
 
         pipe_r, pipe_w = os.pipe()
 
@@ -317,7 +352,7 @@ class FreebuffWorker:
 
     def _get_project_chat_dir(self) -> Optional[str]:
         """Finds the most recent chat directory for this worker's workspace."""
-        pattern = os.path.expanduser(f"~/.config/manicode/projects/{self.project_basename}/chats/*")
+        pattern = os.path.join(self.home_dir, f".config/manicode/projects/{self.project_basename}/chats/*")
         dirs = sorted(glob.glob(pattern), key=os.path.getmtime)
         return dirs[-1] if dirs else None
 
@@ -337,7 +372,7 @@ class FreebuffWorker:
         if not target_model_key:
             return
 
-        settings_path = os.path.expanduser("~/.config/manicode/settings.json")
+        settings_path = os.path.join(self.home_dir, ".config/manicode/settings.json")
         current_key = None
         settings_data = {}
         if os.path.exists(settings_path):
@@ -374,6 +409,11 @@ class FreebuffWorker:
         normalized = os.path.abspath(os.path.expanduser(target_workspace))
         if not os.path.isdir(normalized):
             logger.warning(f"Target workspace does not exist on disk: {normalized}")
+            return
+
+        from .workspace import is_safe_isolated_path
+        if not is_safe_isolated_path(normalized):
+            logger.warning(f"🛡️ [Code-level Guard] Refusing to switch Freebuff worker to sensitive host path: {normalized}")
             return
 
         if os.path.abspath(self.workdir) != normalized:

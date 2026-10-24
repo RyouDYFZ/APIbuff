@@ -10,5 +10,11 @@ export PYTHONPATH="$DIR:$PYTHONPATH"
 HOST="${FREEBUFF_API_HOST:-0.0.0.0}"
 PORT="${FREEBUFF_API_PORT:-8000}"
 
-echo "Starting Freebuff API Gateway on http://${HOST}:${PORT}..."
-exec python3 -m uvicorn app.main:app --host "$HOST" --port "$PORT"
+if [ "$1" = "--docker" ]; then
+    echo "Launching Freebuff API Gateway via Docker Compose..."
+    docker compose up -d
+    echo "✓ Gateway container running on http://127.0.0.1:8000"
+else
+    echo "Starting Freebuff API Gateway on http://${HOST}:${PORT}..."
+    exec python3 -m uvicorn app.main:app --host "$HOST" --port "$PORT"
+fi

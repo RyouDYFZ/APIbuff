@@ -1,16 +1,16 @@
-version: '3.8'
-
 services:
   freebuff-gateway:
     build:
       context: .
       dockerfile: Dockerfile
+    image: freebuff-api-gateway:latest
     container_name: freebuff-api-gateway
+    hostname: standalone-worker-01
     restart: unless-stopped
     ports:
-      - "${FREEBUFF_API_PORT:-8000}:8000"
+      - "127.0.0.1:${FREEBUFF_API_PORT:-8000}:8000"
     environment:
-      # Upstream Codebuff OAuth Token (Obtained from ~/.config/manicode/credentials.json or ./login.sh)
+      # Upstream Codebuff OAuth Token seeded directly into container
       - CODEBUFF_API_KEY=${CODEBUFF_API_KEY:-}
       - FREEBUFF_USER_EMAIL=${FREEBUFF_USER_EMAIL:-cloud@freebuff.local}
       
@@ -22,10 +22,17 @@ services:
       - FREEBUFF_JITTER_MODE=${FREEBUFF_JITTER_MODE:-human}
       - FREEBUFF_TURN_TIMEOUT=${FREEBUFF_TURN_TIMEOUT:-120}
       - PORT=8000
+      
+      # Outbound Network Isolation / Multi-Account VPN Proxy
+      - SUBSCRIPTION_URL=${SUBSCRIPTION_URL:-}
+      - FREEBUFF_ACCOUNTS_FILE=${FREEBUFF_ACCOUNTS_FILE:-accounts.json}
+      - FREEBUFF_LOAD_BALANCE_STRATEGY=${FREEBUFF_LOAD_BALANCE_STRATEGY:-least_busy}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1
     volumes:
-      # Persist credentials, device keys, settings, and logs
+      # Completely isolated Docker internal volumes (Zero bind mounts to Mac host)
       - freebuff_config:/root/.config/manicode
-      # Persist code repository and workspace
       - freebuff_workspace:/workspace
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]

@@ -12,7 +12,7 @@ ENV FREEBUFF_WORKER_WORKDIR=/workspace
 ENV FREEBUFF_SPAWN_MODE=detached_zsh
 ENV SHELL=/bin/zsh
 
-# 1. Install base utilities, Zsh, Git, Node.js & Procps
+# 1. Install base utilities, Zsh, Git, Node.js, Procps & Sing-box multi-protocol proxy engine
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     npm \
@@ -20,8 +20,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zsh \
     procps \
     curl \
+    tar \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH=$(uname -m) \
+    && if [ "$ARCH" = "x86_64" ]; then SB_ARCH="amd64"; elif [ "$ARCH" = "aarch64" ]; then SB_ARCH="arm64"; else SB_ARCH="amd64"; fi \
+    && curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-${SB_ARCH}.tar.gz" -o /tmp/sing-box.tar.gz \
+    && tar -xzf /tmp/sing-box.tar.gz -C /tmp \
+    && mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box \
+    && chmod +x /usr/local/bin/sing-box \
+    && rm -rf /tmp/sing-box* || true
 
 # 2. Install Freebuff CLI globally and pre-cache native Linux binary
 RUN npm install -g freebuff@latest \

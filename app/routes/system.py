@@ -125,6 +125,13 @@ async def set_active_workspace(req: SetWorkspaceRequest):
     if not os.path.isdir(target):
         raise HTTPException(status_code=400, detail=f"Directory does not exist: {target}")
 
+    from ..workspace import is_safe_isolated_path
+    if not is_safe_isolated_path(target):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: path '{target}' is restricted under strict isolation mode."
+        )
+
     if global_pool.worker is None:
         await global_pool.initialize()
 

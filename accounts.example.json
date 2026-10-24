@@ -1,0 +1,30 @@
+{
+  "subscription_url": "https://example.com/api/v1/client/subscribe?token=your_subscription_token",
+  "load_balance_strategy": "least_busy",
+  "accounts": [
+    {
+      "id": "acc_us_01",
+      "name": "US Account 1 (Primary)",
+      "token": "sk-codebuff-your-token-1",
+      "node_filter": "US|United States|美国|美",
+      "weight": 1,
+      "enabled": true
+    },
+    {
+      "id": "acc_jp_02",
+      "name": "Japan Account 2 (Secondary)",
+      "token": "sk-codebuff-your-token-2",
+      "node_filter": "JP|Japan|日本|东京",
+      "weight": 1,
+      "enabled": true
+    },
+    {
+      "id": "acc_sg_03",
+      "name": "Singapore Account 3 (Direct Proxy)",
+      "token": "sk-codebuff-your-token-3",
+      "proxy": "socks5://127.0.0.1:1080",
+      "weight": 1,
+      "enabled": false
+    }
+  ]
+}

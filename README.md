@@ -287,6 +287,73 @@ For conversational pair-programming in Cursor or Cline:
 - Supply `session_id` in request body or pass `X-Session-ID` / `X-Conversation-ID` headers.
 - If the session matches the active conversation, the gateway **preserves native runtime context** and transmits only the newest user prompt turn, dropping multi-turn response latency to **1~2 seconds**.
 
+### 3. Multi-Account Orchestration, Multi-VPN & Load Balancing
+APIbuff natively supports concurrent multi-account operations with isolated per-account VPN/proxy tunnels, dynamic subscription parsing, and transparent 429 failover:
+
+#### Configuration (`accounts.json`)
+Copy `accounts.example.json` to `accounts.json`:
+```json
+{
+  "subscription_url": "https://your-airport.com/api/v1/client/subscribe?token=xxxx",
+  "load_balance_strategy": "least_busy",
+  "accounts": [
+    {
+      "id": "acc_01_us",
+      "name": "US Account 1",
+      "token": "sk-codebuff-token-1",
+      "node_filter": "US|America|美",
+      "weight": 2,
+      "enabled": true
+    },
+    {
+      "id": "acc_02_jp",
+      "name": "Japan Account 2",
+      "token": "sk-codebuff-token-2",
+      "node_filter": "JP|Japan|日本|东京",
+      "weight": 1,
+      "enabled": true
+    },
+    {
+      "id": "acc_03_sg",
+      "name": "Singapore Account 3 (Direct Proxy)",
+      "token": "sk-codebuff-token-3",
+      "proxy": "socks5://127.0.0.1:1080",
+      "weight": 1,
+      "enabled": false
+    }
+  ]
+}
+```
+
+#### Supported VPN & Proxy Protocols (via integrated Sing-box core)
+- **Shadowsocks / ShadowsocksR**
+- **VMess / VLESS**
+- **Trojan**
+- **Hysteria / Hysteria 2**
+- **TUIC / WireGuard**
+- **SOCKS5 / HTTP / HTTPS**
+
+#### Load Balancing & 429 Circuit Breaker
+- **Least-Busy (Default)**: Dispatches requests to the worker with the lowest in-flight active turns (0 concurrency first).
+- **Round-Robin**: Sequentially rotates requests across healthy accounts.
+- **Quota-Aware**: Prioritizes accounts with the highest remaining Freebucks balance.
+- **Transparent 429 Failover**: When any account encounters `429 RateLimit`, the pool marks it in a 60-second cooldown and **transparently retries the turn on the next available account**, delivering an uninterrupted response to Cursor / WebUI.
+
+#### Account & Proxy Management APIs
+```bash
+# 1. View all accounts, assigned VPN nodes, active turns, and balances
+curl http://127.0.0.1:8000/v1/accounts
+
+# 2. Hot-reload accounts and proxies without restarting the gateway
+curl -X POST http://127.0.0.1:8000/v1/accounts/reload
+
+# 3. View parsed proxy nodes from subscription
+curl http://127.0.0.1:8000/v1/proxies/nodes
+
+# 4. Refresh subscription nodes and rebind inbounds
+curl -X POST http://127.0.0.1:8000/v1/proxies/refresh
+```
+
 ---
 
 ## 🛠️ Model Routing & Universal Aliases

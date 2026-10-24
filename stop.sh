@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 echo "Stopping Freebuff API Gateway and workers..."
+docker compose down 2>/dev/null || true
 PIDS=$(lsof -ti :8000 2>/dev/null || true)
 if [ -n "$PIDS" ]; then
     kill -9 $PIDS 2>/dev/null || true

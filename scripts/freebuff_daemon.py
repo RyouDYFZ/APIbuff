@@ -12,6 +12,8 @@ import json
 import asyncio
 import logging
 import signal
+import hashlib
+from typing import Optional
 from pathlib import Path
 
 # Add parent directory to sys.path
@@ -27,11 +29,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("freebuff.daemon")
 
-SOCKET_PATH = "/tmp/freebuff-daemon.sock"
+
+def default_socket_path() -> str:
+    override = os.environ.get("FREEBUFF_DAEMON_SOCKET")
+    if override:
+        return override
+    project_id = hashlib.sha256(os.fsencode(Path(__file__).resolve().parent.parent)).hexdigest()[:16]
+    runtime_dir = Path("/tmp") / f"freebuff-daemon-{os.getuid()}-{project_id}"
+    runtime_dir.mkdir(mode=0o700, exist_ok=True)
+    try:
+        os.chmod(runtime_dir, 0o700)
+    except OSError:
+        pass
+    return str(runtime_dir / "daemon.sock")
+
+
+SOCKET_PATH = default_socket_path()
 
 class DaemonServer:
-    def __init__(self, socket_path: str = SOCKET_PATH):
-        self.socket_path = socket_path
+    def __init__(self, socket_path: Optional[str] = None):
+        self.socket_path = socket_path or default_socket_path()
         self.worker = FreebuffWorker()
         self.server = None
 
@@ -49,6 +66,10 @@ class DaemonServer:
             self.handle_client,
             path=self.socket_path
         )
+        try:
+            os.chmod(self.socket_path, 0o600)
+        except OSError:
+            pass
         logger.info(f"Freebuff Daemon listening on Unix socket: {self.socket_path}")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):

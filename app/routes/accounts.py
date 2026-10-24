@@ -3,12 +3,12 @@ FastAPI Routes for Multi-Account Monitoring, VPN Proxy Management, and Load Bala
 """
 
 from fastapi import APIRouter, HTTPException
-from typing import Dict, Any, List
-import time
+from typing import Dict, Any
 
 from ..accounts import global_account_manager
 from ..proxy_manager import global_proxy_manager
 from ..pool import global_pool
+from ..exceptions import FreebuffException
 
 router = APIRouter()
 
@@ -26,7 +26,7 @@ async def get_accounts_status() -> Dict[str, Any]:
             "cooling_accounts": cooling_count,
             "load_balance_strategy": global_account_manager.load_balance_strategy,
             "subscription_configured": bool(global_account_manager.subscription_url),
-            "singbox_active": global_proxy_manager.process is not None
+            "singbox_active": global_proxy_manager.is_running
         },
         "accounts": acc_list
     }
@@ -35,15 +35,16 @@ async def get_accounts_status() -> Dict[str, Any]:
 async def reload_accounts() -> Dict[str, Any]:
     """Hot-reloads accounts.json and updates proxy bindings without gateway downtime."""
     try:
-        global_account_manager.load_accounts()
-        await global_pool.initialize()
+        await global_pool.reload()
         return {
             "status": "success",
             "message": "Accounts and proxy bindings reloaded successfully.",
             "total_accounts": len(global_account_manager.accounts)
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reload accounts: {e}")
+    except FreebuffException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to reload accounts; check the server configuration.") from None
 
 @router.get("/v1/proxies/nodes")
 async def get_proxy_nodes() -> Dict[str, Any]:
@@ -61,10 +62,14 @@ async def refresh_proxies() -> Dict[str, Any]:
     if not global_account_manager.subscription_url:
         raise HTTPException(status_code=400, detail="No subscription_url configured in accounts.json")
 
-    nodes = global_proxy_manager.fetch_subscription(global_account_manager.subscription_url)
-    global_account_manager.load_accounts()
+    try:
+        await global_pool.reload()
+    except FreebuffException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to refresh proxies; check the server configuration.") from None
     return {
         "status": "success",
-        "node_count": len(nodes),
+        "node_count": len(global_proxy_manager.nodes),
         "active_inbounds": global_proxy_manager.active_inbounds
     }

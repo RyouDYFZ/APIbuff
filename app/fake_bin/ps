@@ -1,0 +1,35 @@
+#!/bin/sh
+# Only the CLI's exact query for this worker's supervisor gets a terminal name.
+# All other queries, and failures of the real query, retain system ps behavior.
+
+if [ "$#" -eq 4 ] &&
+   [ "$1" = "-o" ] && [ "$2" = "ppid=,comm=" ] &&
+   [ "$3" = "-p" ] && [ -n "${_FREEBUFF_PS_SUPERVISOR_PID:-}" ] &&
+   [ "$4" = "$_FREEBUFF_PS_SUPERVISOR_PID" ]; then
+    case "$4" in
+        ''|*[!0-9]*|0|1) exec /bin/ps "$@" ;;
+    esac
+    output=$(/bin/ps "$@")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        [ -z "$output" ] || printf '%s\n' "$output"
+        exit "$status"
+    fi
+    # Keep the actual PPID. The CLI only needs the comm column for its bucket.
+    IFS=' ' read -r parent command <<EOF
+$output
+EOF
+    case "$parent" in
+        ''|*[!0-9]*) printf '%s\n' "$output"; exit 0 ;;
+    esac
+    case "${command##*/}" in
+        Python|python|python[0-9.]*|pypy|pypy3)
+            printf '%s %s\n' "$parent" /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+            exit 0
+            ;;
+    esac
+    printf '%s\n' "$output"
+    exit 0
+fi
+
+exec /bin/ps "$@"

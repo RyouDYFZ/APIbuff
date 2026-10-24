@@ -1,5 +1,8 @@
 import os
 import sys
+import tempfile
+import getpass
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -16,9 +19,9 @@ from app.terminal_env import get_standard_terminal_env
 class TestIsolationGuards(unittest.TestCase):
     def test_sanitize_host_paths(self):
         # 1. macOS personal path
-        raw1 = "Fix the error in /Users/dannyfeng/Documents/MyProject/main.py immediately"
+        raw1 = "Fix the error in /Users/developer/Documents/MyProject/main.py immediately"
         scrubbed1 = sanitize_host_paths(raw1)
-        self.assertNotIn("dannyfeng", scrubbed1)
+        self.assertNotIn("developer", scrubbed1)
         self.assertIn("/workspace/Documents/MyProject/main.py", scrubbed1)
 
         # 2. Linux personal home path
@@ -33,23 +36,28 @@ class TestIsolationGuards(unittest.TestCase):
         self.assertNotIn("Administrator", scrubbed3)
 
     def test_is_safe_isolated_path(self):
-        with patch("app.workspace.STRICT_ISOLATION", True):
+        with tempfile.TemporaryDirectory() as allowed_root, patch.dict(os.environ, {
+            "FREEBUFF_WORKER_WORKDIR": allowed_root,
+            "FREEBUFF_ALLOWED_WORKSPACE_ROOTS": "",
+        }), patch("app.workspace.STRICT_ISOLATION", True):
             # Sensitive host personal paths must be blocked in strict isolation
-            self.assertFalse(is_safe_isolated_path("/Users/dannyfeng/Documents"))
-            self.assertFalse(is_safe_isolated_path("/Users/dannyfeng"))
+            self.assertFalse(is_safe_isolated_path("/Users/developer/Documents"))
+            self.assertFalse(is_safe_isolated_path("/Users/developer"))
+            self.assertFalse(is_safe_isolated_path(str(Path.home())))
             self.assertFalse(is_safe_isolated_path("/private/var/folders/mc"))
 
             # Isolated sandbox paths must be allowed
-            os.makedirs("/tmp/freebuff-api-worker", exist_ok=True)
-            self.assertTrue(is_safe_isolated_path("/tmp/freebuff-api-worker"))
+            self.assertTrue(is_safe_isolated_path(allowed_root))
 
     def test_workspace_git_info_scrubbing(self):
         with patch("app.workspace.STRICT_ISOLATION", True):
             git_info = get_workspace_git_info(os.getcwd())
             # Remote URL must be suppressed in strict isolation
             self.assertIsNone(git_info.get("remote_url"), "Git remote URL must be redacted in strict isolation!")
-            # Path must be sanitized
-            self.assertNotIn("dannyfeng", git_info.get("path", ""))
+            # Path must be sanitized and not leak host user identity
+            current_user = getpass.getuser()
+            if current_user:
+                self.assertNotIn(current_user, git_info.get("path", ""))
 
     def test_terminal_env_scrubbing(self):
         env = get_standard_terminal_env()
@@ -60,9 +68,22 @@ class TestIsolationGuards(unittest.TestCase):
         for k in env:
             self.assertFalse(k.startswith("Apple_"), f"Found leaking Apple env: {k}")
             self.assertFalse(k.startswith("XPC_"), f"Found leaking XPC env: {k}")
-        # PATH must not contain /Users/dannyfeng
+        # PATH must not contain host user directories
+        current_user = getpass.getuser()
         for p in env.get("PATH", "").split(":"):
-            self.assertNotIn("dannyfeng", p, f"Found leaking user path in PATH: {p}")
+            if current_user:
+                self.assertNotIn(current_user, p, f"Found leaking user path in PATH: {p}")
+
+    def test_inherited_or_overridden_cli_trust_cannot_bypass_gateway_opt_in(self):
+        for value in ("1", "true", "yes"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "FREEBUFF_TRUST_AGENTS": "false",
+                "CODEBUFF_TRUST_AGENT_DIRS": value,
+            }):
+                self.assertNotIn("CODEBUFF_TRUST_AGENT_DIRS", get_standard_terminal_env())
+                self.assertNotIn("CODEBUFF_TRUST_AGENT_DIRS", get_standard_terminal_env({
+                    "CODEBUFF_TRUST_AGENT_DIRS": value,
+                }))
 
 if __name__ == "__main__":
     unittest.main()

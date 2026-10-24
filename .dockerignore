@@ -15,4 +15,10 @@ tests/__pycache__
 app/__pycache__
 .env
 .env.*
+accounts.json
+accounts.*.json
+!accounts.example.json
+.venv
+venv
+reports
 .pytest_cache

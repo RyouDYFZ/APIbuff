@@ -5,11 +5,13 @@ import logging
 from typing import Optional, List, Dict, Any
 from fastapi import Request
 from .models import ChatMessage
+from .exceptions import FreebuffException, FreebuffPermissionError
 
 logger = logging.getLogger("freebuff.workspace")
 
-# Strict isolation flag: when True, prevents any host user paths or git remotes from reaching Freebuff
+# Controls metadata redaction. Workspace allowlist enforcement is always enabled.
 STRICT_ISOLATION = os.getenv("FREEBUFF_STRICT_ISOLATION", "false").lower() == "true"
+GIT_COMMAND_TIMEOUT_SECONDS = 5
 
 # Patterns commonly injected by clients (Cline, Roo Code, Continue, Cursor, Windsurf, Aider)
 WORKSPACE_PATTERNS = [
@@ -33,28 +35,52 @@ def sanitize_host_paths(text: str, replacement_root: str = "/workspace") -> str:
     scrubbed = re.sub(r'[a-zA-Z]:\\Users\\[a-zA-Z0-9_\-\.]+', replacement_root, scrubbed)
     return scrubbed
 
+def allowed_workspace_roots() -> List[str]:
+    """Return operator-configured roots, resolved through symlinks before comparison."""
+    roots = [os.getenv("FREEBUFF_WORKER_WORKDIR", "/tmp/freebuff-api-worker")]
+    roots.extend(os.getenv("FREEBUFF_ALLOWED_WORKSPACE_ROOTS", "").split(os.pathsep))
+    return [os.path.realpath(os.path.expanduser(root.strip())) for root in roots if root.strip()]
+
+
 def is_safe_isolated_path(path: str) -> bool:
+    """Accept existing directories only within a configured, real filesystem root.
+
+    Names such as ``sandbox`` or ``worker`` grant no authority. This is a path
+    selection boundary, not an OS filesystem sandbox for the CLI process.
     """
-    Validates whether a workspace path is safe and detached from the host personal directories.
-    In strict isolation mode, blocks any path that exposes the host user's personal home or Documents.
-    """
-    if not path or not os.path.isdir(path):
+    if not isinstance(path, str) or not path.strip() or "\0" in path:
+        return False
+    try:
+        normalized = os.path.realpath(os.path.expanduser(path))
+        if not os.path.isdir(normalized):
+            return False
+        return any(os.path.commonpath((root, normalized)) == root for root in allowed_workspace_roots())
+    except (OSError, ValueError):
         return False
 
-    if STRICT_ISOLATION:
-        norm = os.path.abspath(os.path.expanduser(path))
-        # Disallow host user root paths
-        if norm.startswith("/Users/") or norm.startswith("/home/"):
-            # Allowed only if it is a designated isolated sandbox
-            if "isolated" in norm or "worker" in norm or "sandbox" in norm:
-                return True
-            logger.warning(f"🛡️ [Code-level Block] Intercepted host user path '{norm}'. Refusing to bind to Freebuff.")
-            return False
-        if norm.startswith("/private/var"):
-            logger.warning(f"🛡️ [Code-level Block] Intercepted macOS private path '{norm}'.")
-            return False
 
-    return True
+def validate_workspace_path(path: str) -> str:
+    """Validate an explicit selection without silently selecting another directory."""
+    if not isinstance(path, str) or not path.strip() or "\0" in path:
+        raise FreebuffException(
+            "Workspace must be a nonempty directory path.", status_code=400,
+            error_type="invalid_request_error", error_code="invalid_workspace",
+        )
+    try:
+        normalized = os.path.realpath(os.path.expanduser(path.strip()))
+        exists = os.path.isdir(normalized)
+    except (OSError, ValueError):
+        exists = False
+    if not exists:
+        raise FreebuffException(
+            "Workspace directory does not exist.", status_code=400,
+            error_type="invalid_request_error", error_code="invalid_workspace",
+        )
+    if not is_safe_isolated_path(normalized):
+        raise FreebuffPermissionError(
+            "Workspace is outside the configured allowed roots.", error_code="workspace_not_allowed",
+        )
+    return normalized
 
 def resolve_target_workspace(
     http_request: Optional[Request] = None,
@@ -63,52 +89,39 @@ def resolve_target_workspace(
     default_fallback: Optional[str] = None
 ) -> Optional[str]:
     """
-    Multi-tier resolution of target workspace with strict code-level host decoupling:
+    Resolve an authorized selection, leaving account defaults to the worker pool:
     1. HTTP headers (X-Workspace-Path, X-Project-Dir, X-Cwd, X-Workspace)
     2. Request body fields (workspace, cwd, project_dir)
-    3. Intelligent pattern discovery in system/user messages (Cline/Cursor/Continue/Roo Code prompts)
-    4. Default workspace fallback
+    3. Pattern discovery in system/developer messages
+    4. An explicitly supplied, validated default (otherwise None)
     """
     # 1. Check HTTP Headers
     if http_request:
         for header_name in ["x-workspace-path", "x-project-dir", "x-cwd", "x-workspace"]:
             val = http_request.headers.get(header_name)
-            if val and val.strip():
-                candidate = os.path.abspath(os.path.expanduser(val.strip()))
-                if is_safe_isolated_path(candidate):
-                    logger.info(f"Resolved workspace from HTTP header '{header_name}': {candidate}")
-                    return candidate
+            if val is not None:
+                return validate_workspace_path(val)
 
     # 2. Check Request Body field
-    if body_workspace and body_workspace.strip():
-        candidate = os.path.abspath(os.path.expanduser(body_workspace.strip()))
-        if is_safe_isolated_path(candidate):
-            logger.info(f"Resolved workspace from request body: {candidate}")
-            return candidate
+    if body_workspace is not None:
+        return validate_workspace_path(body_workspace)
 
     # 3. Intelligent extraction from prompt messages (Cline, Roo Code, Continue, Cursor)
     if messages:
         for msg in messages:
+            if msg.role not in ("system", "developer"):
+                continue
             content = msg.content
             if not content or len(content) < 5:
                 continue
             for pattern in WORKSPACE_PATTERNS:
                 match = pattern.search(content)
                 if match:
-                    raw_path = match.group(1).strip()
-                    candidate = os.path.abspath(os.path.expanduser(raw_path))
-                    if is_safe_isolated_path(candidate):
-                        logger.info(f"Auto-discovered workspace from client prompt: {candidate}")
-                        return candidate
+                    return validate_workspace_path(match.group(1).strip())
 
-    # 4. Fallback (guaranteed safe sandbox)
-    if default_fallback and os.path.isdir(default_fallback):
-        return default_fallback
-
-    # Fallback to standard sandbox workdir
-    sandbox = os.getenv("FREEBUFF_WORKER_WORKDIR", "/tmp/freebuff-api-worker")
-    os.makedirs(sandbox, exist_ok=True)
-    return sandbox
+    if default_fallback is not None:
+        return validate_workspace_path(default_fallback)
+    return None
 
 def get_workspace_git_info(workspace_path: str) -> Dict[str, Any]:
     """
@@ -143,7 +156,7 @@ def get_workspace_git_info(workspace_path: str) -> Dict[str, Any]:
     try:
         branch = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=workspace_path, stderr=subprocess.DEVNULL
+            cwd=workspace_path, stderr=subprocess.DEVNULL, timeout=GIT_COMMAND_TIMEOUT_SECONDS
         ).decode().strip()
         info["branch"] = branch
     except Exception:
@@ -152,7 +165,7 @@ def get_workspace_git_info(workspace_path: str) -> Dict[str, Any]:
     try:
         count = subprocess.check_output(
             ["git", "rev-list", "--count", "HEAD"],
-            cwd=workspace_path, stderr=subprocess.DEVNULL
+            cwd=workspace_path, stderr=subprocess.DEVNULL, timeout=GIT_COMMAND_TIMEOUT_SECONDS
         ).decode().strip()
         info["commit_count"] = int(count)
     except Exception:
@@ -161,7 +174,7 @@ def get_workspace_git_info(workspace_path: str) -> Dict[str, Any]:
     try:
         diff_out = subprocess.check_output(
             ["git", "status", "--porcelain"],
-            cwd=workspace_path, stderr=subprocess.DEVNULL
+            cwd=workspace_path, stderr=subprocess.DEVNULL, timeout=GIT_COMMAND_TIMEOUT_SECONDS
         ).decode().strip()
         if diff_out:
             lines = [l for l in diff_out.splitlines() if l.strip()]
@@ -173,7 +186,7 @@ def get_workspace_git_info(workspace_path: str) -> Dict[str, Any]:
     try:
         last_log = subprocess.check_output(
             ["git", "log", "-1", "--format=%h %s (%an, %cr)"],
-            cwd=workspace_path, stderr=subprocess.DEVNULL
+            cwd=workspace_path, stderr=subprocess.DEVNULL, timeout=GIT_COMMAND_TIMEOUT_SECONDS
         ).decode().strip()
         if STRICT_ISOLATION:
             # Redact personal author name to "Cloud Developer"
@@ -186,7 +199,7 @@ def get_workspace_git_info(workspace_path: str) -> Dict[str, Any]:
         if not STRICT_ISOLATION:
             remote = subprocess.check_output(
                 ["git", "remote", "get-url", "origin"],
-                cwd=workspace_path, stderr=subprocess.DEVNULL
+                cwd=workspace_path, stderr=subprocess.DEVNULL, timeout=GIT_COMMAND_TIMEOUT_SECONDS
             ).decode().strip()
             info["remote_url"] = remote
         else:

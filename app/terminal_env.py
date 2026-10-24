@@ -3,7 +3,10 @@ import sys
 import plistlib
 import subprocess
 import logging
-from typing import Dict, Any, Optional, Tuple
+import math
+import re
+from typing import Dict, Any, Mapping, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("freebuff.env")
 
@@ -146,114 +149,227 @@ def get_standard_terminal_env(
     if custom_overrides:
         env.update(custom_overrides)
 
+    # Repository code trust is controlled only by the gateway's explicit
+    # FREEBUFF_TRUST_AGENTS opt-in. A host-wide CLI opt-in must not bypass it.
+    env.pop("CODEBUFF_TRUST_AGENT_DIRS", None)
+
+    # Separate controls: /api/logs is upstream-supported; PostHog requires
+    # our verified private CLI build. Preserve local log.jsonl output.
+    env["CODEBUFF_SHIP_LOGS"] = "false"
+    env["CODEBUFF_DISABLE_POSTHOG"] = "1"
+    # The gateway owns and closes this PTY; no detached terminal-reset helper is needed.
+    env["CODEBUFF_NO_TERMINAL_WATCHDOG"] = "1"
+
     return env
 
-def compute_simulated_x_freebuff_env(env: Dict[str, str], parent_kind: str = "shell", grandparent_kind: str = "terminal") -> str:
-    """
-    Simulates the exact `x-freebuff-env` descriptor string that Freebuff CLI's
-    client-environment.ts produces for this environment.
-    Format: v1;in=1;out=1;tp=<bucket>;term=1;ct=1;sz=120x40;ci=0;ssh=0;l=1;p=<parent>;g=<grandparent>;...
-    """
-    tp_raw = (env.get("TERM_PROGRAM") or "").lower()
-    tp_bucket = "none"
-    if "iterm" in tp_raw:
-        tp_bucket = "iterm"
-    elif "apple_terminal" in tp_raw or "terminal" in tp_raw:
-        tp_bucket = "apple_terminal"
-    elif "vscode" in tp_raw:
-        tp_bucket = "vscode"
-    elif "ghostty" in tp_raw:
-        tp_bucket = "ghostty"
-    elif tp_raw:
-        tp_bucket = "other"
+_SHELL_NAMES = frozenset({
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu",
+    "elvish", "xonsh", "pwsh", "powershell", "cmd", "login",
+})
+_TERMINAL_NAMES = frozenset({
+    "terminal", "iterm2", "ghostty", "wezterm", "wezterm-gui", "alacritty",
+    "kitty", "warp", "stable", "hyper", "tabby", "konsole", "gnome-terminal",
+    "gnome-terminal-server", "gnome-terminal-", "xfce4-terminal", "mate-terminal",
+    "lxterminal", "tilix", "terminator", "xterm", "urxvt", "rxvt", "st", "foot",
+    "rio", "mintty", "windowsterminal", "openconsole", "conhost", "contour",
+    "blackbox", "ptyxis", "ptyxis-agent",
+})
+_EDITOR_NAMES = frozenset({
+    "code", "code-insiders", "cursor", "windsurf", "zed", "idea", "pycharm",
+    "webstorm", "goland", "clion", "rider", "phpstorm", "rubymine", "datagrip",
+    "fleet", "nvim", "vim", "emacs", "helix", "hx", "sublime_text",
+})
+_MULTIPLEXER_NAMES = frozenset({"tmux", "screen", "zellij", "byobu", "abduco"})
+_PROCESS_KINDS = frozenset({
+    "shell", "terminal", "editor", "mux", "sshd", "node", "python", "bun",
+    "other", "unknown", "na",
+})
+_TERMINAL_PROGRAM_BUCKETS = {
+    "apple_terminal": "apple_terminal", "iterm.app": "iterm", "iterm2": "iterm",
+    "vscode": "vscode", "ghostty": "ghostty", "wezterm": "wezterm",
+    "warpterminal": "warp", "hyper": "hyper", "tmux": "tmux", "zed": "zed",
+    "tabby": "tabby", "rio": "rio", "mintty": "mintty",
+    "jetbrains-jediterm": "jetbrains", "kitty": "kitty", "alacritty": "alacritty",
+}
 
-    term_flag = 1 if env.get("TERM") else 0
-    ct_flag = 1 if env.get("COLORTERM") else 0
-    sz = f"{env.get('COLUMNS', '120')}x{env.get('LINES', '40')}"
-    ssh_flag = 1 if (env.get("SSH_CLIENT") or env.get("SSH_TTY")) else 0
-    ci_flag = 1 if env.get("CI") else 0
 
+def bucket_process_name(raw_name: Optional[str]) -> str:
+    """Apply the extracted CLI's fixed process categories to a ps comm value."""
+    if not raw_name:
+        return "unknown"
+    name = raw_name.strip().rsplit("/", 1)[-1].lstrip("-")
+    name = re.sub(r"\.exe$", "", name, flags=re.IGNORECASE).lower()
+    if not name:
+        return "unknown"
+    if name in _SHELL_NAMES:
+        return "shell"
+    if name in _MULTIPLEXER_NAMES or name.startswith("tmux"):
+        return "mux"
+    if name == "sshd" or name.startswith("sshd-"):
+        return "sshd"
+    if name in ("node", "nodejs"):
+        return "node"
+    if re.fullmatch(r"python[0-9.]*", name) or name in ("pypy", "pypy3"):
+        return "python"
+    if name == "bun":
+        return "bun"
+    if name in _TERMINAL_NAMES:
+        return "terminal"
+    if name in _EDITOR_NAMES or re.match(r"^(code|cursor|windsurf|zed|electron)( helper|$)", name):
+        return "editor"
+    return "other"
+
+
+def _proxy_bucket(value: Optional[str]) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return "none"
+    try:
+        host = urlsplit(raw if "://" in raw else "http://" + raw).hostname or ""
+        if re.fullmatch(r"localhost|127(?:\.\d{1,3}){3}|::1|0\.0\.0\.0", host, re.IGNORECASE):
+            return "loopback"
+    except ValueError:
+        pass
+    return "remote"
+
+
+def _configured_dimension(value: Optional[str]) -> int:
+    try:
+        number = float(value)
+        if math.isfinite(number):
+            return max(0, min(9999, math.floor(number)))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return 0
+
+
+def compute_simulated_x_freebuff_env(
+    env: Mapping[str, str],
+    parent_kind: str = "unknown",
+    grandparent_kind: str = "unknown",
+    *,
+    launcher: bool = False,
+    system_zone: Optional[str] = None,
+) -> str:
+    """Predict a descriptor from configuration; this is not a captured header.
+
+    Process categories follow the extracted CLI. TTY flags assume the worker's
+    PTY and dimensions come from configuration, not target-process observations.
+    The terminal's colour reply is unknown. A system zone must be supplied
+    separately because the TZ override does not identify the OS time zone.
+    """
+    tp_raw = (env.get("TERM_PROGRAM") or "").strip().lower()
+    tp_bucket = _TERMINAL_PROGRAM_BUCKETS.get(tp_raw, "other") if tp_raw else "none"
+    proxy_buckets = [_proxy_bucket(env.get(key)) for key in (
+        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+    )]
+    proxy = "loopback" if "loopback" in proxy_buckets else "remote" if "remote" in proxy_buckets else "none"
+    cloud_ide = "none"
+    if env.get("CODESPACES", "").strip().lower() == "true":
+        cloud_ide = "codespaces"
+    elif env.get("GITPOD_WORKSPACE_ID", "").strip():
+        cloud_ide = "gitpod"
+    elif env.get("CLOUD_SHELL", "").strip().lower() == "true":
+        cloud_ide = "cloudshell"
+    elif env.get("CODER", "").strip().lower() == "true":
+        cloud_ide = "coder"
+    tz_override = bool(env.get("TZ", "").strip())
     fields = [
         ("in", "1"),
         ("out", "1"),
         ("tp", tp_bucket),
-        ("term", str(term_flag)),
-        ("ct", str(ct_flag)),
-        ("sz", sz),
-        ("ci", str(ci_flag)),
-        ("ssh", str(ssh_flag)),
-        ("l", "1"),
-        ("p", parent_kind),
-        ("g", grandparent_kind),
-        ("osc", "1"),
-        ("tzo", "0"),
-        ("px", "none"),
-        ("tls", "1"),
-        ("ca", "0")
+        ("term", str(int(bool(env.get("TERM"))))),
+        ("ct", str(int(bool(env.get("COLORTERM"))))),
+        ("sz", f"{_configured_dimension(env.get('COLUMNS'))}x{_configured_dimension(env.get('LINES'))}"),
+        ("ci", str(int(env.get("CI") in ("true", "1") or env.get("GITHUB_ACTIONS") == "true"))),
+        ("ssh", str(int(bool(env.get("SSH_TTY") or env.get("SSH_CONNECTION"))))),
+        ("l", str(int(bool(launcher)))),
+        ("p", parent_kind if parent_kind in _PROCESS_KINDS else "unknown"),
+        ("g", grandparent_kind if grandparent_kind in _PROCESS_KINDS else "unknown"),
+        ("osc", "na"),
+        ("tzo", str(int(tz_override))),
+        ("px", proxy),
+        ("tls", "0" if env.get("NODE_TLS_REJECT_UNAUTHORIZED", "").strip() == "0" else "1"),
+        ("ca", str(int(bool(env.get("NODE_EXTRA_CA_CERTS", "").strip())))),
+        ("cde", cloud_ide),
     ]
-    return "v1;" + ";".join(f"{k}={v}" for k, v in fields)
+    if tz_override and system_zone:
+        zone = system_zone.strip().rsplit("zoneinfo/", 1)[-1]
+        if len(zone) <= 64 and re.fullmatch(r"[A-Za-z]+(?:/[A-Za-z0-9_+-]+){1,2}", zone):
+            fields.append(("stz", zone))
+    return "v1;" + ";".join(f"{key}={value}" for key, value in fields)
 
-def audit_runtime_environment(pid: Optional[int] = None) -> Dict[str, Any]:
+
+def audit_runtime_environment(
+    pid: Optional[int] = None,
+    *,
+    launcher_pid: Optional[Union[int, str]] = None,
+    descriptor_env: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Read a process ancestry snapshot and predict its configured descriptor.
+
+    The caller must identify an npm launcher explicitly. An inherited launcher
+    variable in gateway configuration is not evidence about the target. No
+    target-process environment or request headers are read by this diagnostic.
     """
-    Audits the current or specified process environment and ancestry.
-    Returns structured verification results.
-    """
-    target_pid = pid or os.getpid()
-    
+    target_pid = os.getpid() if pid is None else pid
     ancestry = []
     curr = target_pid
-    for _ in range(4):
+    seen = set()
+    # The diagnostic observes the real process tree even when a worker's PATH
+    # contains a compatibility shim for CLI process-name queries.
+    ps_path = "/bin/ps" if sys.platform == "darwin" else "/usr/bin/ps"
+    if not os.path.isfile(ps_path):
+        ps_path = "/bin/ps"
+    # The target plus two ancestors, and one extra for a confirmed npm launcher.
+    for _ in range(0 if sys.platform == "win32" else 4):
+        if not isinstance(curr, int) or isinstance(curr, bool) or curr < 1 or curr in seen:
+            break
+        seen.add(curr)
         try:
             out = subprocess.check_output(
-                ["ps", "-o", "pid=,ppid=,comm=", "-p", str(curr)],
-                stderr=subprocess.DEVNULL
+                [ps_path, "-o", "pid=,ppid=,comm=", "-p", str(curr)],
+                timeout=2, stderr=subprocess.DEVNULL,
             ).decode().strip()
-            if not out:
+            parts = out.splitlines()[0].split(None, 2) if out else []
+            if len(parts) != 3:
                 break
-            parts = out.split(None, 2)
-            if len(parts) >= 3:
-                p_pid, p_ppid, p_comm = int(parts[0]), int(parts[1]), parts[2]
-                ancestry.append({"pid": p_pid, "ppid": p_ppid, "comm": p_comm})
-                curr = p_ppid
-                if p_ppid <= 1:
-                    break
-            else:
+            process_pid, parent_pid, command = int(parts[0]), int(parts[1]), parts[2]
+            if process_pid != curr:
                 break
-        except Exception:
+            entry = {"pid": process_pid, "ppid": parent_pid, "comm": command}
+            if sys.platform == "linux":
+                # Linux comm is configurable by the process itself. Preserve
+                # executable evidence separately instead of treating the name
+                # as proof that a terminal application is actually running.
+                try:
+                    entry["executable"] = os.readlink(f"/proc/{process_pid}/exe")
+                except OSError:
+                    pass
+            ancestry.append(entry)
+            curr = parent_pid
+        except (OSError, ValueError, subprocess.SubprocessError):
             break
 
-    parent_kind = "unknown"
-    grandparent_kind = "unknown"
-    if len(ancestry) >= 2:
-        p_name = ancestry[1]["comm"].lower()
-        if "zsh" in p_name or "bash" in p_name or "sh" in p_name:
-            parent_kind = "shell"
-        elif "python" in p_name:
-            parent_kind = "python"
-        elif "launchd" in p_name:
-            parent_kind = "launchd"
-        else:
-            parent_kind = "other"
+    launcher = bool(ancestry and launcher_pid is not None and str(launcher_pid) == str(ancestry[0]["ppid"]))
+    parent_index = 2 if launcher else 1
+    parent_kind = bucket_process_name(ancestry[parent_index]["comm"] if len(ancestry) > parent_index else None)
+    grandparent_kind = bucket_process_name(ancestry[parent_index + 1]["comm"] if len(ancestry) > parent_index + 1 else None)
+    if sys.platform == "win32":
+        parent_kind = grandparent_kind = "na"
+        launcher = False
 
-    if len(ancestry) >= 3:
-        gp_name = ancestry[2]["comm"].lower()
-        if "zsh" in gp_name or "bash" in gp_name:
-            grandparent_kind = "shell"
-        elif "launchd" in gp_name:
-            grandparent_kind = "launchd"
-        elif "terminal" in gp_name or "iterm" in gp_name:
-            grandparent_kind = "terminal"
-        else:
-            grandparent_kind = "other"
-
-    env = get_standard_terminal_env()
-    simulated_descriptor = compute_simulated_x_freebuff_env(env, parent_kind=parent_kind, grandparent_kind=grandparent_kind)
-
+    env = get_standard_terminal_env() if descriptor_env is None else descriptor_env
+    simulated_descriptor = compute_simulated_x_freebuff_env(
+        env, parent_kind=parent_kind, grandparent_kind=grandparent_kind, launcher=launcher,
+    )
     return {
         "target_pid": target_pid,
         "ancestry": ancestry,
+        "ancestry_source": "system_process_snapshot",
         "parent_kind": parent_kind,
         "grandparent_kind": grandparent_kind,
+        "launcher_skipped": launcher,
         "terminal_program": env.get("TERM_PROGRAM"),
         "terminal_program_version": env.get("TERM_PROGRAM_VERSION"),
         "shell": env.get("SHELL"),
@@ -261,6 +377,11 @@ def audit_runtime_environment(pid: Optional[int] = None) -> Dict[str, Any]:
         "term": env.get("TERM"),
         "colorterm": env.get("COLORTERM"),
         "simulated_x_freebuff_env": simulated_descriptor,
-        "is_p_python_eliminated": parent_kind != "python",
-        "is_interactive_shell_parent": parent_kind == "shell",
+        "descriptor_source": "prediction_from_gateway_configuration",
+        "descriptor_environment_source": "gateway_configuration" if descriptor_env is None else "caller_configuration",
+        "descriptor_verified": False,
+        "predicted_fields": ["in", "out", "sz"],
+        "unobserved_fields": ["osc"],
+        "shell_parent_observed": parent_kind == "shell",
+        "interactive_shell_verified": False,
     }

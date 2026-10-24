@@ -4,10 +4,58 @@ import random
 import math
 import asyncio
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Callable
 
 logger = logging.getLogger("freebuff.jitter")
+
+MAX_DELAY_MS = 5000.0
+MAX_TARGET_CPS = 1000.0
+
+
+async def _wait_writable(fd: int):
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    def wake():
+        if not ready.done():
+            ready.set_result(None)
+    loop.add_writer(fd, wake)
+    try:
+        await ready
+    finally:
+        loop.remove_writer(fd)
+
+
+async def write_all(fd: int, payload: bytes):
+    """Write every byte without blocking the event loop on a full pipe or PTY."""
+    was_blocking = os.get_blocking(fd)
+    if was_blocking:
+        os.set_blocking(fd, False)
+    view = memoryview(payload)
+    offset = 0
+    try:
+        while offset < len(view):
+            try:
+                written = os.write(fd, view[offset:offset + 65536])
+            except BlockingIOError:
+                await _wait_writable(fd)
+                continue
+            except InterruptedError:
+                await asyncio.sleep(0)
+                continue
+            if written <= 0:
+                raise OSError("Terminal write made no progress")
+            offset += written
+            if offset < len(view):
+                await asyncio.sleep(0)
+    finally:
+        if was_blocking:
+            try:
+                os.set_blocking(fd, True)
+            except OSError:
+                pass  # The owner may have closed the descriptor during teardown.
+
 
 @dataclass
 class JitterConfig:
@@ -19,6 +67,27 @@ class JitterConfig:
     pre_enter_max_ms: float = 500.0
     target_max_cps: float = 11.5
     punctuation_pause: bool = True
+
+    def __post_init__(self):
+        self.validate()
+
+    def validate(self):
+        if self.mode not in {"human", "fast", "instant"}:
+            raise ValueError("Unsupported typing mode")
+        if self.distribution not in {"poisson", "gaussian", "uniform"}:
+            raise ValueError("Unsupported interval distribution")
+        for name in ("min_delay_ms", "max_delay_ms", "pre_enter_min_ms", "pre_enter_max_ms"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= MAX_DELAY_MS:
+                raise ValueError(f"{name} must be finite and between 0 and {MAX_DELAY_MS:g}")
+        if self.min_delay_ms > self.max_delay_ms:
+            raise ValueError("min_delay_ms must not exceed max_delay_ms")
+        if self.pre_enter_min_ms > self.pre_enter_max_ms:
+            raise ValueError("pre_enter_min_ms must not exceed pre_enter_max_ms")
+        cps = self.target_max_cps
+        if isinstance(cps, bool) or not isinstance(cps, (int, float)) or not math.isfinite(cps) or not 1 <= cps <= MAX_TARGET_CPS:
+            raise ValueError(f"target_max_cps must be finite and between 1 and {MAX_TARGET_CPS:g}")
+
 
 @dataclass
 class JitterMetrics:
@@ -56,8 +125,8 @@ class JitterMetrics:
 
 class KeystrokeJitterSimulator:
     """
-    Simulates authentic human typing cadence with configurable Poisson/Gaussian intervals,
-    natural punctuation hesitations, pre-Enter pauses, and sliding-window CPS enforcement.
+    Produces a configurable local typing simulation with measured intervals and CPS.
+    These local measurements do not establish an upstream service input profile.
     """
     def __init__(self, config: Optional[JitterConfig] = None):
         self.config = config or JitterConfig()
@@ -67,6 +136,8 @@ class KeystrokeJitterSimulator:
         max_ms = self.config.max_delay_ms
         mean_ms = (min_ms + max_ms) / 2.0
 
+        if mean_ms <= 0:
+            return 0.0
         if self.config.distribution == "poisson":
             # Exponential inter-arrival distribution for Poisson point process
             rate = 1.0 / mean_ms
@@ -82,7 +153,7 @@ class KeystrokeJitterSimulator:
             d *= random.uniform(1.25, 1.65)
 
         # Clamp to realistic bounds
-        return max(min_ms, min(max_ms * 1.8, d))
+        return max(min_ms, min(max_ms, d))
 
     async def type_into_fd(
         self,
@@ -95,16 +166,17 @@ class KeystrokeJitterSimulator:
         Asynchronously writes text character-by-character into fd with jitter delays.
         Guarantees sliding window CPS <= target_max_cps and measures exact composeMs.
         """
+        self.config.validate()
         if not text:
             if append_return:
-                os.write(fd, b"\r")
+                await write_all(fd, b"\r")
             return JitterMetrics()
 
         if self.config.mode == "instant":
-            start_ts = time.time() * 1000.0
+            start_ts = time.monotonic() * 1000.0
             payload = text.encode("utf-8") + (b"\r" if append_return else b"")
-            os.write(fd, payload)
-            end_ts = time.time() * 1000.0
+            await write_all(fd, payload)
+            end_ts = time.monotonic() * 1000.0
             duration = end_ts - start_ts
             return JitterMetrics(
                 typed_chars=len(text),
@@ -118,10 +190,10 @@ class KeystrokeJitterSimulator:
         # In fast mode, scale intervals down
         speed_factor = 0.25 if self.config.mode == "fast" else 1.0
 
-        start_time = time.time() * 1000.0
+        start_time = time.monotonic() * 1000.0
         timestamps: List[float] = []
         intervals: List[float] = []
-        window_times: List[float] = []
+        window_times = deque()
         max_cps = 0
 
         cur_time = start_time
@@ -129,26 +201,24 @@ class KeystrokeJitterSimulator:
         for i, char in enumerate(text):
             delay_ms = self._sample_interval(char) * speed_factor
 
-            # Sliding-window CPS fence: prevent burst exceeding target_max_cps
-            if self.config.target_max_cps > 0 and self.config.mode != "fast":
-                while True:
-                    candidate_arrival = cur_time + delay_ms
-                    cutoff = candidate_arrival - 1000.0
-                    chars_in_window = sum(1 for t in window_times if t >= cutoff) + 1
-                    if chars_in_window <= self.config.target_max_cps:
-                        break
-                    # Pace typing to keep CPS strictly under threshold
-                    delay_ms += 15.0
+            # Calculate the next allowed arrival directly. A fractional CPS
+            # budget still permits only its floor in each one-second window.
+            if self.config.mode == "human":
+                budget = int(self.config.target_max_cps)
+                candidate_arrival = cur_time + delay_ms
+                if len(window_times) >= budget:
+                    candidate_arrival = max(candidate_arrival, window_times[-budget] + 1000.001)
+                delay_ms = max(0, candidate_arrival - time.monotonic() * 1000.0)
 
             # Perform the async sleep for this character delay
             sleep_sec = max(0.001, delay_ms / 1000.0)
             await asyncio.sleep(sleep_sec)
 
-            # Write single character byte to terminal
+            # Encode each code point and completely write its UTF-8 bytes
             char_bytes = char.encode("utf-8")
-            os.write(fd, char_bytes)
+            await write_all(fd, char_bytes)
 
-            actual_now = time.time() * 1000.0
+            actual_now = time.monotonic() * 1000.0
             actual_interval = actual_now - cur_time
             cur_time = actual_now
 
@@ -158,7 +228,9 @@ class KeystrokeJitterSimulator:
 
             # Compute sliding-window CPS
             cutoff_now = actual_now - 1000.0
-            window_count = sum(1 for t in window_times if t >= cutoff_now)
+            while window_times and window_times[0] <= cutoff_now:
+                window_times.popleft()
+            window_count = len(window_times)
             if window_count > max_cps:
                 max_cps = window_count
 
@@ -176,9 +248,9 @@ class KeystrokeJitterSimulator:
                 pre_enter_ms = random.uniform(self.config.pre_enter_min_ms, self.config.pre_enter_max_ms)
 
             await asyncio.sleep(pre_enter_ms / 1000.0)
-            os.write(fd, b"\r")
+            await write_all(fd, b"\r")
 
-        finish_time = time.time() * 1000.0
+        finish_time = time.monotonic() * 1000.0
         total_compose_ms = finish_time - start_time
 
         avg_interval = sum(intervals) / len(intervals) if intervals else 0.0
@@ -219,23 +291,24 @@ class KeystrokeJitterSimulator:
         append_return: bool = True
     ) -> JitterMetrics:
         """
-        Simulates authentic human bracketed-paste entry for large or multiline texts.
+        Sends bracketed-paste input for large or multiline texts.
         Encapsulates with \x1b[200~ and \x1b[201~, records pasteEvents & pastedChars,
         and adds realistic pre-Enter hesitation.
         """
-        start_time = time.time() * 1000.0
+        self.config.validate()
+        start_time = time.monotonic() * 1000.0
         # Send bracketed paste sequences
         paste_bytes = f"\x1b[200~{text}\x1b[201~".encode("utf-8")
-        os.write(fd, paste_bytes)
+        await write_all(fd, paste_bytes)
 
         pre_enter_ms = 0.0
         if append_return:
             # Human visual review pause after paste (300-600ms)
             pre_enter_ms = random.uniform(self.config.pre_enter_min_ms, self.config.pre_enter_max_ms)
             await asyncio.sleep(pre_enter_ms / 1000.0)
-            os.write(fd, b"\r")
+            await write_all(fd, b"\r")
 
-        finish_time = time.time() * 1000.0
+        finish_time = time.monotonic() * 1000.0
         total_compose_ms = finish_time - start_time
 
         simulated_profile = (

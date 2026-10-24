@@ -1,0 +1,54 @@
+# Run this file separately, once per account, with a distinct project name,
+# env file and loopback port. See README.md. Volumes are scoped to the project.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: freebuff-api-gateway:account-isolated
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    extra_hosts:
+      - "proxy.internal=${FREEBUFF_PROXY_LISTEN_IP:-127.0.0.1}"
+    ports:
+      - "127.0.0.1:${FREEBUFF_API_PORT:?Set a unique FREEBUFF_API_PORT for this account}:8000"
+    environment:
+      CODEBUFF_API_KEY: ${CODEBUFF_API_KEY:?Set this account's CODEBUFF_API_KEY}
+      FREEBUFF_API_KEY: ${FREEBUFF_API_KEY:?Set this gateway's FREEBUFF_API_KEY}
+      FREEBUFF_USER_EMAIL: ${FREEBUFF_USER_EMAIL:-cloud@freebuff.local}
+      FREEBUFF_DEFAULT_MODEL: ${FREEBUFF_DEFAULT_MODEL:-glm-5.3-flash}
+      FREEBUFF_TURN_TIMEOUT: ${FREEBUFF_TURN_TIMEOUT:-120}
+      FREEBUFF_SUPERVISOR_PS_SHIM: ${FREEBUFF_SUPERVISOR_PS_SHIM:-true}
+      FREEBUFF_JITTER_MODE: ${FREEBUFF_JITTER_MODE:-human}
+      FREEBUFF_TAKEOVER_AUTO_CONFIRM: "false"
+      CODEBUFF_SHIP_LOGS: "false"
+      # No accounts file is mounted here: this instance uses its one env token.
+      FREEBUFF_ACCOUNTS_FILE: /run/freebuff/single-account.json
+      FREEBUFF_SANDBOX_DIR: /var/lib/freebuff/accounts
+      FREEBUFF_BIN: ${FREEBUFF_BIN:-/root/.config/manicode/freebuff}
+      FREEBUFF_HARDWARE_PRIVACY: ${FREEBUFF_HARDWARE_PRIVACY:-auto}
+      FREEBUFF_WORKER_WORKDIR: /workspace
+      FREEBUFF_API_HOST: 0.0.0.0
+      FREEBUFF_API_PORT: "8000"
+      PORT: "8000"
+      FREEBUFF_PROXY_LISTEN_IP: ${FREEBUFF_PROXY_LISTEN_IP:-127.0.0.1}
+      FREEBUFF_PROXY_HOST: ${FREEBUFF_PROXY_HOST:-proxy.internal}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1
+    volumes:
+      - config:/root/.config/manicode
+      - accounts:/var/lib/freebuff/accounts
+      - workspace:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  config:
+  accounts:
+  workspace:

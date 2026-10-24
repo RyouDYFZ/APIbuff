@@ -5,10 +5,15 @@ import json
 import urllib.request
 import urllib.error
 
+from pathlib import Path
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 BASE_URL = "http://127.0.0.1:8000"
-REAL_REPO_PATH = "/Users/dannyfeng/Documents/Freebuff Research"
+REAL_REPO_PATH = os.environ.get(
+    "REAL_REPO_PATH",
+    str(Path(__file__).resolve().parents[1])
+)
 
 def test_get_current_workspace():
     print("[1/4] Testing GET /v1/workspace ...")

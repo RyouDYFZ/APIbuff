@@ -1,139 +1,113 @@
-"""
-Authentication probe and token validation module for Freebuff CLI.
-Provides proactive validation against Codebuff / Freebuff API without blocking inference turns.
-"""
-
-import os
-import sys
-import shutil
+"""Explicit, scoped credential diagnostics; public health never calls this module."""
+import hashlib
 import json
+import os
+import threading
 import time
-import subprocess
-import logging
-from typing import Optional, Dict, Any
+from copy import deepcopy
+from typing import Any, Dict, Optional
+
 import requests
 
-logger = logging.getLogger("freebuff.auth_probe")
+from .credentials import default_config_dir
 
+API_HOST = "https://www.codebuff.com"
 _CACHE_RESULT: Optional[Dict[str, Any]] = None
-_CACHE_TIMESTAMP: float = 0.0
-_CACHE_TTL: float = 60.0  # cache validation results for 60 seconds
+_CACHE_TIMESTAMP = 0.0
+_CACHE_SCOPE = None
+_CACHE_TTL = 60.0
+_CACHE_LOCK = threading.RLock()
 
-def get_stored_token() -> Optional[str]:
+
+def _token(value):
+    return value.strip() if isinstance(value, str) and value.strip() not in ("", "unauthenticated") else None
+
+
+def read_auth_context(config_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Use only this profile's inline token or an explicitly supplied env token.
+
+    A keychain pointer is intentionally unresolved. Reading a generic keychain
+    service can select a different profile, and can prompt on a headless server.
     """
-    Reads the Freebuff auth token from environment variables (cloud),
-    macOS Keychain (service: freebuff-cli), or ~/.config/manicode/credentials.json.
-    """
-    import shutil
-    env_token = os.environ.get("CODEBUFF_API_KEY") or os.environ.get("FREEBUFF_AUTH_TOKEN")
-    if env_token:
-        return env_token.strip()
+    directory = os.path.abspath(os.path.expanduser(config_dir or default_config_dir()))
+    data = {}
+    try:
+        with open(os.path.join(directory, "credentials.json"), encoding="utf-8") as handle:
+            loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                data = loaded
+    except (OSError, ValueError):
+        pass
+    profile = data.get("default")
+    profile = profile if isinstance(profile, dict) else {}
+    file_token = _token(profile.get("authToken"))
+    if not profile:
+        file_token = _token(data.get("accessToken")) or _token(data.get("token"))
+    env_token = _token(os.environ.get("CODEBUFF_API_KEY")) or _token(os.environ.get("FREEBUFF_AUTH_TOKEN"))
+    token = env_token or file_token
+    # Match the CLI's accountFor(): a stored ID belongs only to that same token.
+    account_id = profile.get("id") if token and token == file_token else None
+    if not isinstance(account_id, str) or not account_id:
+        account_id = None
+    return {
+        "config_dir": directory,
+        "token": token,
+        "account_id": account_id,
+        "source": "environment" if env_token else "credentials_file" if file_token else "keychain_unavailable" if profile.get("tokenStore") == "keychain" else "missing",
+    }
 
-    # Query macOS Keychain (only on darwin when security CLI exists)
-    if sys.platform == "darwin" and shutil.which("security"):
-        try:
-            out = subprocess.check_output(
-                ["security", "find-generic-password", "-s", "freebuff-cli", "-w"],
-                stderr=subprocess.DEVNULL
-            )
-            token = out.decode().strip()
-            if token:
-                return token
-        except Exception:
-            pass
 
-    # Fallback to credentials.json
-    creds_path = os.path.expanduser("~/.config/manicode/credentials.json")
-    if os.path.exists(creds_path):
-        try:
-            with open(creds_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                token = data.get("token") or (data.get("default", {}).get("authToken"))
-                if token:
-                    return token.strip()
-        except Exception:
-            pass
+def get_stored_token(config_dir: Optional[str] = None) -> Optional[str]:
+    return read_auth_context(config_dir)["token"]
 
-    return None
 
 def verify_token(force: bool = False) -> Dict[str, Any]:
-    """
-    Verifies if the current token is authenticated against https://www.codebuff.com/api/v1/me.
-    Results are cached for 60 seconds to avoid unnecessary network latency.
-    """
-    global _CACHE_RESULT, _CACHE_TIMESTAMP
-
-    now = time.time()
-    if not force and _CACHE_RESULT is not None and (now - _CACHE_TIMESTAMP < _CACHE_TTL):
-        return _CACHE_RESULT
-
-    token = get_stored_token()
-    if not token:
+    """Opt-in /me diagnostic, cached only for the same directory and token."""
+    global _CACHE_RESULT, _CACHE_TIMESTAMP, _CACHE_SCOPE
+    with _CACHE_LOCK:
+        context = read_auth_context()
+        token = context["token"]
+        scope = (context["config_dir"], hashlib.sha256(token.encode()).hexdigest() if token else None)
+        now = time.time()
+        if not force and scope == _CACHE_SCOPE and _CACHE_RESULT is not None and now - _CACHE_TIMESTAMP < _CACHE_TTL:
+            return deepcopy(_CACHE_RESULT)
         result = {
-            "valid": False,
-            "status": "missing",
-            "message": "No Freebuff credentials found in Keychain. Run ./login.sh to authenticate.",
+            "valid": None,
+            "status": "unknown",
+            "message": "Credential validity has not been established.",
             "email": None,
             "id": None,
-            "login_command": "./login.sh",
-            "timestamp": now
+            "login_command": None,
+            "timestamp": now,
+            "source": context["source"],
+            "scope": "default_credentials_only",
         }
-        _CACHE_RESULT = result
-        _CACHE_TIMESTAMP = now
-        return result
-
-    try:
-        url = "https://www.codebuff.com/api/v1/me?fields=id,email"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "freebuff-api-gateway/1.0"
-        }
-        resp = requests.get(url, headers=headers, timeout=2.5)
-        
-        if resp.status_code == 200:
-            user_data = resp.json()
-            result = {
-                "valid": True,
-                "status": "authenticated",
-                "message": "Credentials verified with Freebuff servers.",
-                "email": user_data.get("email"),
-                "id": user_data.get("id"),
-                "login_command": None,
-                "timestamp": now
-            }
-        elif resp.status_code in [401, 403]:
-            result = {
-                "valid": False,
-                "status": "expired",
-                "message": f"Token expired or unauthorized (HTTP {resp.status_code}). Run ./login.sh to refresh.",
-                "email": None,
-                "id": None,
-                "login_command": "./login.sh",
-                "timestamp": now
-            }
+        if not token:
+            result.update(
+                status="unknown" if context["source"] == "keychain_unavailable" else "missing",
+                message="The configured profile has no readable inline token; keychain pointers are not resolved by this gateway.",
+            )
         else:
-            result = {
-                "valid": False,
-                "status": "error",
-                "message": f"Server returned unexpected status {resp.status_code}.",
-                "email": None,
-                "id": None,
-                "login_command": "./login.sh",
-                "timestamp": now
-            }
-    except Exception as e:
-        logger.debug(f"Token verification probe network error: {e}")
-        # Network issue or timeout
-        result = {
-            "valid": False,
-            "status": "unreachable",
-            "message": f"Could not reach Freebuff authentication server ({e}). Best-effort fallback.",
-            "email": None,
-            "id": None,
-            "login_command": "./login.sh",
-            "timestamp": now
-        }
-
-    _CACHE_RESULT = result
-    _CACHE_TIMESTAMP = now
-    return result
+            try:
+                response = requests.get(
+                    API_HOST + "/api/v1/me?fields=id,email",
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": "freebuff-api-gateway/1.0"},
+                    timeout=2.5,
+                )
+                result["http_status"] = response.status_code
+                if response.status_code == 200:
+                    user = response.json()
+                    if isinstance(user, dict) and isinstance(user.get("id"), str) and user["id"]:
+                        result.update(valid=True, status="authenticated", message="The explicit identity diagnostic accepted these credentials.", email=user.get("email"), id=user["id"])
+                    else:
+                        result["message"] = "The identity endpoint returned an unrecognized response; credential validity is unknown."
+                elif response.status_code == 401:
+                    result.update(valid=False, status="unauthorized", message="The identity diagnostic rejected these credentials (HTTP 401).")
+                elif response.status_code == 403:
+                    result.update(status="forbidden", message="The identity diagnostic was denied (HTTP 403); this does not establish token expiry.")
+                else:
+                    result["message"] = f"The identity diagnostic returned HTTP {response.status_code}; credential validity is unknown."
+            except Exception:
+                result.update(status="unreachable", message="The identity diagnostic could not be completed; credential validity is unknown.")
+        _CACHE_RESULT, _CACHE_TIMESTAMP, _CACHE_SCOPE = deepcopy(result), now, scope
+        return result

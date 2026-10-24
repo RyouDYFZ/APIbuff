@@ -1,11 +1,16 @@
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
 
 from .config import API_KEY
 from .pool import global_pool
+from .lifecycle import gateway_control
+from .credentials import default_config_dir, write_cli_credentials
+from .exceptions import FreebuffException
 from .routes import chat, models, health, system, accounts
 
 # Configure logging
@@ -16,46 +21,27 @@ logging.basicConfig(
 logger = logging.getLogger("freebuff.api")
 
 def ensure_cloud_credentials():
-    """
-    Seeds ~/.config/manicode/credentials.json if CODEBUFF_API_KEY is supplied via environment.
-    Enables zero-touch headless cloud deployment on Docker, Render, Koyeb, Hugging Face, or Linux VPS.
-    """
+    """Seed the official CLI profile for an explicitly supplied cloud token."""
     import os
-    import json
     token = os.environ.get("CODEBUFF_API_KEY") or os.environ.get("FREEBUFF_AUTH_TOKEN")
     if token:
-        config_dir = os.path.expanduser("~/.config/manicode")
-        os.makedirs(config_dir, exist_ok=True)
-        creds_file = os.path.join(config_dir, "credentials.json")
-        creds_data = {}
-        if os.path.exists(creds_file):
-            try:
-                with open(creds_file, "r") as f:
-                    creds_data = json.load(f)
-            except Exception:
-                creds_data = {}
-
-        default_block = creds_data.get("default", {})
-        if not default_block.get("authToken") or default_block.get("authToken") != token.strip():
-            default_block["authToken"] = token.strip()
-            default_block["tokenStore"] = "file"
-            default_block["id"] = default_block.get("id") or "cloud-user"
-            default_block["email"] = os.getenv("FREEBUFF_USER_EMAIL", default_block.get("email", "cloud@freebuff.local"))
-            creds_data["default"] = default_block
-            with open(creds_file, "w") as f:
-                json.dump(creds_data, f, indent=2)
-            logger.info("Automatically initialized cloud credentials from CODEBUFF_API_KEY environment variable.")
+        write_cli_credentials(
+            default_config_dir(), token, email=os.getenv("FREEBUFF_USER_EMAIL")
+        )
+        logger.info("Initialized cloud credentials from the supplied environment token.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Ensure credentials and warm Freebuff CLI instance
-    ensure_cloud_credentials()
-    logger.info("Initializing Freebuff worker pool...")
-    await global_pool.initialize()
-    yield
-    # Shutdown: Cleanly terminate child processes
-    logger.info("Shutting down Freebuff worker pool...")
-    await global_pool.shutdown()
+    async with gateway_control():
+        try:
+            ensure_cloud_credentials()
+            logger.info("Initializing Freebuff worker pool...")
+            await global_pool.initialize()
+            yield
+        finally:
+            # Also clean partially initialized workers if startup fails.
+            logger.info("Shutting down Freebuff worker pool...")
+            await global_pool.shutdown()
 
 app = FastAPI(
     title="Freebuff OpenAI-Compatible API Gateway",
@@ -64,37 +50,83 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS configuration for client apps (Open WebUI, NextChat, Cursor, Cherry Studio)
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, error: RequestValidationError):
+    first = error.errors()[0]
+    location = ".".join(str(part) for part in first["loc"] if part != "body") or None
+    return JSONResponse(status_code=422, content={"error": {
+        "message": first["msg"],
+        "type": "invalid_request_error",
+        "param": location,
+        "code": "invalid_request",
+    }})
+
+
+@app.exception_handler(FreebuffException)
+async def gateway_error_handler(request: Request, error: FreebuffException):
+    headers = {}
+    if getattr(error, "retry_after", None) is not None:
+        headers["Retry-After"] = str(error.retry_after)
+    return JSONResponse(status_code=error.status_code, content=error.to_dict(), headers=headers)
+
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(request: Request, error: HTTPException):
+    detail = error.detail
+    if isinstance(detail, dict) and "error" in detail:
+        payload = detail
+    elif isinstance(detail, dict) and "message" in detail:
+        payload = {"error": detail}
+    else:
+        payload = {"error": {
+            "message": str(detail),
+            "type": "invalid_request_error" if error.status_code < 500 else "api_error",
+            "param": None,
+            "code": "http_error",
+        }}
+    return JSONResponse(status_code=error.status_code, content=payload, headers=error.headers)
+
+# Pure ASGI auth preserves stream cancellation without spawning an intermediary
+# response task or converting a cancelled preflight into a server error.
+class APIKeyAuthMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope["path"] in ("/", "/health", "/docs", "/openapi.json")
+            or not API_KEY
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        auth_header = request.headers.get("Authorization")
+        parts = auth_header.split() if auth_header else []
+        if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1] != API_KEY:
+            response = JSONResponse(status_code=401, content={"error": {
+                "message": "Invalid API Key" if auth_header else "Missing Authorization header",
+                "type": "authentication_error",
+                "param": None,
+                "code": "invalid_api_key",
+            }})
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(APIKeyAuthMiddleware)
+
+# Added last so CORS wraps authentication: browser preflights do not carry the
+# bearer token, while every actual API request still passes through auth.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Optional API Key Authentication Middleware
-@app.middleware("http")
-async def api_key_auth_middleware(request: Request, call_next):
-    # Skip auth for health and docs
-    if request.url.path in ("/", "/health", "/docs", "/openapi.json"):
-        return await call_next(request)
-
-    if API_KEY:
-        auth_header = request.headers.get("Authorization")
-        if not auth_header:
-            return JSONResponse(
-                status_code=401,
-                content={"error": {"message": "Missing Authorization header", "type": "auth_error"}}
-            )
-        parts = auth_header.split()
-        if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1] != API_KEY:
-            return JSONResponse(
-                status_code=401,
-                content={"error": {"message": "Invalid API Key", "type": "auth_error"}}
-            )
-
-    return await call_next(request)
 
 # Mount API routers
 app.include_router(health.router)

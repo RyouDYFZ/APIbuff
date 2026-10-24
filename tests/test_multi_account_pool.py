@@ -1,6 +1,6 @@
 """
 Integration Test Suite for Multi-Account Orchestration, Multi-Protocol VPN Parsing,
-Sing-box Inbound/Outbound Binding, Load Balancing (Least-Busy, Round-Robin), and 429 Transparent Failover.
+Sing-box Inbound/Outbound Binding, Load Balancing (Least-Busy, Round-Robin), and refusal propagation without retries.
 """
 
 import os
@@ -9,6 +9,7 @@ import json
 import base64
 import time
 import shutil
+import tempfile
 import unittest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +24,14 @@ from app.models import ChatMessage
 from app.exceptions import FreebuffRateLimitError, FreebuffAuthError, FreebuffServerError
 
 class TestMultiAccountAndVPN(unittest.TestCase):
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory.name
+        sandbox = patch("app.accounts.BASE_SANDBOX_DIR", os.path.join(self.directory, "accounts"))
+        sandbox.start()
+        self.addCleanup(sandbox.stop)
 
     def test_01_clash_subscription_parsing(self):
         """Verifies parsing of Clash/Mihomo YAML subscription with multiple protocols."""
@@ -142,7 +151,7 @@ proxies:
 
         # If sing-box binary exists, test validation
         if pm.singbox_bin and os.path.exists(pm.singbox_bin):
-            test_path = "/tmp/test_singbox_generated.json"
+            test_path = os.path.join(self.directory, "singbox-generated.json")
             with open(test_path, "w") as f:
                 json.dump(cfg, f, indent=2)
             import subprocess
@@ -151,7 +160,7 @@ proxies:
 
     def test_04_account_sandbox_isolation(self):
         """Verifies that each account gets an isolated credentials file and sandbox."""
-        tmp_accounts_file = "/tmp/test_accounts.json"
+        tmp_accounts_file = os.path.join(self.directory, "accounts.json")
         acc_data = {
             "load_balance_strategy": "least_busy",
             "accounts": [
@@ -184,7 +193,7 @@ proxies:
         self.assertTrue(os.path.exists(creds_file_1))
         with open(creds_file_1, "r") as f:
             c1 = json.load(f)
-            self.assertEqual(c1["accessToken"], "sk-token-account-01")
+            self.assertEqual(c1["default"]["authToken"], "sk-token-account-01")
 
         # Check sandbox 2
         acc2 = am.get_account("acc_isolated_02")
@@ -192,7 +201,7 @@ proxies:
         self.assertTrue(os.path.exists(creds_file_2))
         with open(creds_file_2, "r") as f:
             c2 = json.load(f)
-            self.assertEqual(c2["accessToken"], "sk-token-account-02")
+            self.assertEqual(c2["default"]["authToken"], "sk-token-account-02")
 
         # Confirm homes are distinct
         self.assertNotEqual(acc1.home_dir, acc2.home_dir)
@@ -240,48 +249,39 @@ proxies:
             self.assertEqual([r1.config.id, r2.config.id, r3.config.id, r4.config.id],
                              ["acc_lb_1", "acc_lb_2", "acc_lb_3", "acc_lb_1"])
 
-    def test_06_transparent_failover_on_429(self):
-        """Verifies transparent failover: Worker 1 raises 429, pool immediately fails over to Worker 2."""
+    def test_06_429_is_returned_without_cross_account_retry(self):
+        """An upstream rate limit must not be bypassed through another account."""
         pool = MultiAccountWorkerPool()
-
         acc1 = AccountState(AccountConfig(id="acc_fo_1", name="Acc 1", token="tok1"))
         acc2 = AccountState(AccountConfig(id="acc_fo_2", name="Acc 2", token="tok2"))
-
+        error = FreebuffRateLimitError("Rate limit exceeded")
         w1 = MagicMock(is_running=True)
         w2 = MagicMock(is_running=True)
-
-        # Worker 1 raises RateLimit 429
-        w1.execute_turn = AsyncMock(side_effect=FreebuffRateLimitError("Rate limit exceeded"))
-        w1.ensure_workspace = AsyncMock()
-        w1.ensure_model = AsyncMock()
-
-        # Worker 2 succeeds
-        w2.execute_turn = AsyncMock(return_value={"content": "Success response from Account 2"})
-        w2.ensure_workspace = AsyncMock()
-        w2.ensure_model = AsyncMock()
-
+        for worker in (w1, w2):
+            worker.ensure_workspace = AsyncMock()
+            worker.ensure_model = AsyncMock()
+            worker.stop = AsyncMock()
+        w1.execute_turn = AsyncMock(side_effect=error)
+        w2.execute_turn = AsyncMock(return_value={"content": "must not execute"})
         pool.workers = {"acc_fo_1": w1, "acc_fo_2": w2}
 
-        async def run_failover():
-            with patch("app.pool.global_account_manager") as mock_am:
+        async def run_once():
+            with patch("app.pool.global_account_manager") as mock_am, patch.object(pool, "_default_workspace", return_value="/tmp/offline-pool-test"):
                 mock_am.get_healthy_accounts.return_value = [acc1, acc2]
                 mock_am.load_balance_strategy = "least_busy"
                 mock_am.get_account.side_effect = lambda aid: {"acc_fo_1": acc1, "acc_fo_2": acc2}.get(aid)
+                with self.assertRaises(FreebuffRateLimitError) as raised:
+                    await pool.execute_chat([ChatMessage(role="user", content="Test prompt")])
+                self.assertIs(raised.exception, error)
 
-                messages = [ChatMessage(role="user", content="Test prompt")]
-                result = await pool.execute_chat(messages)
-                return result
-
-        res = asyncio.run(run_failover())
-        
-        # Verify seamless success response was returned
-        self.assertEqual(res["content"], "Success response from Account 2")
-        # Verify Account 1 was marked cooling down
-        self.assertTrue(acc1.is_cooling)
-        self.assertEqual(acc1.status, "cooling")
+        asyncio.run(run_once())
+        self.assertFalse(acc1.is_cooling)
+        self.assertEqual(acc1.status, "rate_limited")
         self.assertEqual(acc1.failed_requests, 1)
-        # Verify Account 2 handled the request
-        self.assertEqual(acc2.total_requests, 1)
+        self.assertEqual(acc2.total_requests, 0)
+        w1.execute_turn.assert_awaited_once()
+        w1.stop.assert_awaited_once()
+        w2.execute_turn.assert_not_awaited()
 
 if __name__ == "__main__":
     unittest.main()

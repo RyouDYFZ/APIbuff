@@ -1,9 +1,14 @@
+import asyncio
+import json
+import logging
 import time
 import uuid
-import json
-import asyncio
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+
+import anyio
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
+
 from ..models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -12,209 +17,259 @@ from ..models import (
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
     ChatCompletionChunkDelta,
-    UsageInfo,
-    resolve_model_id
+    resolve_model_id,
 )
 from ..pool import global_pool
 from ..workspace import resolve_target_workspace
 from ..exceptions import FreebuffException
 
 router = APIRouter()
+logger = logging.getLogger("freebuff.chat")
+
+
+async def _cancel_and_wait(*tasks):
+    """Return only after the execution (including worker cleanup) has stopped."""
+    tasks = [task for task in tasks if task is not None]
+    for task in tasks:
+        if not task.done() and not task.cancelling():
+            task.cancel()
+    # AnyIO scopes and repeated Task.cancel() calls must not cancel the cleanup
+    # itself. Multiple owners may wait for the same execution during a disconnect.
+    cancelled = None
+    with anyio.CancelScope(shield=True):
+        finished = asyncio.gather(*tasks, return_exceptions=True)
+        while True:
+            try:
+                await asyncio.shield(finished)
+                break
+            except asyncio.CancelledError as error:
+                cancelled = error
+    if cancelled is not None:
+        raise cancelled
+
+
+async def _first_event(queue, http_request):
+    """Wait before sending headers, observing disconnects during that wait."""
+    async def wait_for_disconnect():
+        while True:
+            message = await http_request.receive()
+            if message["type"] == "http.disconnect":
+                return
+
+    event_task = asyncio.create_task(queue.get(), name="chat-first-event")
+    disconnect_task = asyncio.create_task(wait_for_disconnect(), name="chat-preflight-disconnect")
+    try:
+        done, _ = await asyncio.wait(
+            (event_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if disconnect_task in done:
+            disconnect_task.result()
+            raise asyncio.CancelledError()
+        return event_task.result()
+    finally:
+        await _cancel_and_wait(event_task, disconnect_task)
+
+
+class _ExecutionStreamingResponse(StreamingResponse):
+    """Own the task even if sending headers/body fails before iteration starts."""
+    def __init__(self, *args, execution_task, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.execution_task = execution_task
+
+    async def __call__(self, scope, receive, send):
+        # Watch receive even on ASGI 2.4: a client can leave between tokens,
+        # when there is no send() call available to report a disconnect.
+        body_task = asyncio.create_task(self.stream_response(send), name="chat-stream-body")
+        disconnect_task = asyncio.create_task(self.listen_for_disconnect(receive), name="chat-stream-disconnect")
+        try:
+            done, _ = await asyncio.wait(
+                (body_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if body_task in done:
+                body_task.result()
+            else:
+                disconnect_task.result()
+        except OSError as error:
+            raise ClientDisconnect() from error
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await _cancel_and_wait(body_task, disconnect_task)
+                    await self.body_iterator.aclose()
+                finally:
+                    await _cancel_and_wait(self.execution_task)
+        if self.background is not None:
+            await self.background()
+
+
+def _error_response(error):
+    headers = {}
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return JSONResponse(status_code=error.status_code, content=error.to_dict(), headers=headers)
+
+
+def _result_suffixes(result, emitted_content, emitted_reasoning):
+    if not isinstance(result, dict):
+        raise FreebuffException("Invalid completion result from the worker.", 502, error_code="invalid_upstream_response")
+    content = result.get("content")
+    reasoning = result.get("reasoning_content")
+    reasoning = "" if reasoning is None else reasoning
+    if not isinstance(content, str) or not isinstance(reasoning, str):
+        raise FreebuffException("Invalid completion text from the worker.", 502, error_code="invalid_upstream_response")
+    if not content and not reasoning:
+        raise FreebuffException("The CLI completed without a public text response.", 502, error_code="empty_upstream_response")
+    # Validate both channels before emitting either suffix. Changed final text
+    # cannot safely be appended to bytes the client has already received.
+    if not content.startswith(emitted_content) or not reasoning.startswith(emitted_reasoning):
+        raise FreebuffException(
+            "The final completion did not match the streamed text.",
+            status_code=502,
+            error_type="api_error",
+            error_code="stream_mismatch",
+        )
+    return content[len(emitted_content):], reasoning[len(emitted_reasoning):]
+
 
 @router.post("/v1/chat/completions")
 @router.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, http_request: Request):
-    """
-    OpenAI-compatible /v1/chat/completions endpoint.
-    Supports both standard non-streaming responses and Server-Sent Events (SSE) streaming.
-    Automatically resolves client workspace directory and supports stateful session continuity.
-    Fails fast with typed OpenAI error payloads upon encountering auth, rate limit, or proxy blocks.
-    """
-    canonical_model = resolve_model_id(request.model)
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created_ts = int(time.time())
+    """OpenAI text completions with independently reconciled SSE channels."""
+    execution_task = None
+    streaming_owns_task = False
+    try:
+        canonical_model = await asyncio.to_thread(resolve_model_id, request.model)
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created_ts = int(time.time())
+        body_workspace = next(
+            (value for value in (request.workspace, request.cwd, request.project_dir) if value is not None),
+            None,
+        )
+        target_workspace = resolve_target_workspace(
+            http_request=http_request,
+            body_workspace=body_workspace,
+            messages=request.messages,
+        )
+        session_id = (
+            request.session_id
+            or http_request.headers.get("X-Session-ID")
+            or http_request.headers.get("X-Conversation-ID")
+        )
+        events = asyncio.Queue()
 
-    # Resolve target project workspace
-    target_workspace = resolve_target_workspace(
-        http_request=http_request,
-        body_workspace=request.workspace or request.cwd or request.project_dir,
-        messages=request.messages
-    )
+        def on_chunk(text, is_reasoning):
+            if not isinstance(text, str) or not isinstance(is_reasoning, bool):
+                raise FreebuffException(
+                    "Invalid completion delta from the worker.", 502,
+                    error_code="invalid_upstream_response",
+                )
+            if text:
+                events.put_nowait(("chunk", (text, is_reasoning)))
 
-    # Extract session ID from headers or body
-    session_id = (
-        request.session_id or
-        http_request.headers.get("X-Session-ID") or
-        http_request.headers.get("X-Conversation-ID")
-    )
-
-    if request.stream:
-        async def stream_generator():
+        async def execute():
             try:
-                # Initial chunk with role
-                first_chunk = ChatCompletionChunk(
-                    id=completion_id,
-                    created=created_ts,
+                result = await global_pool.execute_chat(
+                    messages=request.messages,
                     model=canonical_model,
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            index=0,
-                            delta=ChatCompletionChunkDelta(role="assistant"),
-                            finish_reason=None
-                        )
-                    ]
+                    workspace=target_workspace,
+                    session_id=session_id,
+                    reset_context=request.reset_context,
+                    on_chunk=on_chunk if request.stream else None,
                 )
-                yield f"data: {first_chunk.model_dump_json()}\n\n"
+            except asyncio.CancelledError as error:
+                events.put_nowait(("error", error))
+                raise
+            except Exception as error:
+                events.put_nowait(("error", error))
+            else:
+                events.put_nowait(("result", result))
 
-                chunk_queue = asyncio.Queue()
+        execution_task = asyncio.create_task(execute(), name="chat-execution")
+        first_event = await _first_event(events, http_request)
+        if first_event[0] == "error":
+            raise first_event[1]
+        if first_event[0] == "result":
+            # Malformed results must also fail before headers if no bytes streamed.
+            _result_suffixes(first_event[1], "", "")
 
-                def chunk_callback(token_text: str, is_reasoning: bool):
-                    chunk_queue.put_nowait((token_text, is_reasoning))
+        if not request.stream:
+            content, reasoning = _result_suffixes(first_event[1], "", "")
+            return ChatCompletionResponse(
+                id=completion_id,
+                created=created_ts,
+                model=canonical_model,
+                choices=[ChatCompletionResponseChoice(message=ChatCompletionResponseMessage(
+                    content=content, reasoning_content=reasoning or None,
+                ))],
+            )
 
-                # Run execution in a background task
-                exec_task = asyncio.create_task(
-                    global_pool.execute_chat(
-                        messages=request.messages,
-                        model=request.model,
-                        workspace=target_workspace,
-                        session_id=session_id,
-                        reset_context=request.reset_context,
-                        on_chunk=chunk_callback
-                    )
-                )
+        def chunk(delta, finish_reason=None):
+            payload = ChatCompletionChunk(
+                id=completion_id,
+                created=created_ts,
+                model=canonical_model,
+                choices=[ChatCompletionChunkChoice(delta=delta, finish_reason=finish_reason)],
+            )
+            data = payload.model_dump()
+            data["choices"][0]["delta"] = delta.model_dump(exclude_none=True)
+            return f"data: {json.dumps(data)}\n\n"
 
-                # While task is running, yield any stream items from queue
-                while not exec_task.done() or not chunk_queue.empty():
-                    try:
-                        token_text, is_reasoning = await asyncio.wait_for(chunk_queue.get(), timeout=0.1)
+        async def stream_generator():
+            emitted_content = ""
+            emitted_reasoning = ""
+            event = first_event
+            try:
+                yield chunk(ChatCompletionChunkDelta(role="assistant"))
+                while True:
+                    kind, value = event
+                    if kind == "error":
+                        raise value
+                    if kind == "chunk":
+                        text, is_reasoning = value
                         if is_reasoning:
-                            delta = ChatCompletionChunkDelta(reasoning_content=token_text)
+                            emitted_reasoning += text
+                            delta = ChatCompletionChunkDelta(reasoning_content=text)
                         else:
-                            delta = ChatCompletionChunkDelta(content=token_text)
-                        
-                        chunk = ChatCompletionChunk(
-                            id=completion_id,
-                            created=created_ts,
-                            model=canonical_model,
-                            choices=[ChatCompletionChunkChoice(index=0, delta=delta, finish_reason=None)]
+                            emitted_content += text
+                            delta = ChatCompletionChunkDelta(content=text)
+                        yield chunk(delta)
+                    else:
+                        content_suffix, reasoning_suffix = _result_suffixes(
+                            value, emitted_content, emitted_reasoning
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                    except asyncio.TimeoutError:
-                        continue
-
-                # Await the execution result (will raise FreebuffException if turn failed)
-                result = await exec_task
-                final_content = result.get("content", "")
-                final_reasoning = result.get("reasoning_content")
-
-                # If no streaming chunks were emitted during turn, emit the full response now
-                if final_reasoning:
-                    r_chunk = ChatCompletionChunk(
-                        id=completion_id,
-                        created=created_ts,
-                        model=canonical_model,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=ChatCompletionChunkDelta(reasoning_content=final_reasoning),
-                                finish_reason=None
-                            )
-                        ]
-                    )
-                    yield f"data: {r_chunk.model_dump_json()}\n\n"
-
-                if final_content:
-                    c_chunk = ChatCompletionChunk(
-                        id=completion_id,
-                        created=created_ts,
-                        model=canonical_model,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=ChatCompletionChunkDelta(content=final_content),
-                                finish_reason=None
-                            )
-                        ]
-                    )
-                    yield f"data: {c_chunk.model_dump_json()}\n\n"
-
-                # Final finish_reason: "stop" chunk
-                end_chunk = ChatCompletionChunk(
-                    id=completion_id,
-                    created=created_ts,
-                    model=canonical_model,
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            index=0,
-                            delta=ChatCompletionChunkDelta(),
-                            finish_reason="stop"
-                        )
-                    ]
-                )
-                yield f"data: {end_chunk.model_dump_json()}\n\n"
+                        if reasoning_suffix:
+                            yield chunk(ChatCompletionChunkDelta(reasoning_content=reasoning_suffix))
+                        if content_suffix:
+                            yield chunk(ChatCompletionChunkDelta(content=content_suffix))
+                        yield chunk(ChatCompletionChunkDelta(), finish_reason="stop")
+                        yield "data: [DONE]\n\n"
+                        return
+                    event = await events.get()
+            except FreebuffException as error:
+                yield f"data: {json.dumps(error.to_dict())}\n\n"
                 yield "data: [DONE]\n\n"
-
-            except FreebuffException as e:
-                err_payload = json.dumps(e.to_dict())
-                yield f"data: {err_payload}\n\n"
+            except Exception:
+                logger.exception("Completion stream failed")
+                error = FreebuffException("Chat completion failed.", error_code="internal_error")
+                yield f"data: {json.dumps(error.to_dict())}\n\n"
                 yield "data: [DONE]\n\n"
-            except Exception as e:
-                err_dict = {"error": {"message": str(e), "type": "api_error", "code": 500}}
-                yield f"data: {json.dumps(err_dict)}\n\n"
-                yield "data: [DONE]\n\n"
+            finally:
+                await _cancel_and_wait(execution_task)
 
-        return StreamingResponse(
+        response = _ExecutionStreamingResponse(
             stream_generator(),
+            execution_task=execution_task,
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
-    else:
-        # Non-streaming standard response
-        try:
-            result = await global_pool.execute_chat(
-                messages=request.messages,
-                model=request.model,
-                workspace=target_workspace,
-                session_id=session_id,
-                reset_context=request.reset_context
-            )
-        except FreebuffException as e:
-            raise HTTPException(
-                status_code=e.status_code,
-                detail=e.to_dict()["error"]
-            )
-
-        content = result.get("content", "")
-        reasoning = result.get("reasoning_content")
-
-        response_message = ChatCompletionResponseMessage(
-            role="assistant",
-            content=content,
-            reasoning_content=reasoning
-        )
-
-        prompt_len = sum(len(m.content) for m in request.messages)
-        resp_len = len(content)
-
-        return ChatCompletionResponse(
-            id=completion_id,
-            created=created_ts,
-            model=canonical_model,
-            choices=[
-                ChatCompletionResponseChoice(
-                    index=0,
-                    message=response_message,
-                    finish_reason="stop"
-                )
-            ],
-            usage=UsageInfo(
-                prompt_tokens=max(1, prompt_len // 4),
-                completion_tokens=max(1, resp_len // 4),
-                total_tokens=max(2, (prompt_len + resp_len) // 4)
-            )
-        )
+        streaming_owns_task = True
+        return response
+    except FreebuffException as error:
+        return _error_response(error)
+    except Exception:
+        logger.exception("Completion request failed")
+        return _error_response(FreebuffException("Chat completion failed.", error_code="internal_error"))
+    finally:
+        if not streaming_owns_task:
+            await _cancel_and_wait(execution_task)

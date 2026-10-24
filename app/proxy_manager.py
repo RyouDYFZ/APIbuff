@@ -6,14 +6,16 @@ Integrates with Sing-box to create dedicated, isolated local inbound ports per a
 """
 
 import os
-import sys
 import json
 import base64
+from dataclasses import dataclass
+import ipaddress
 import re
 import shutil
 import logging
-import asyncio
 import subprocess
+import sys
+import tempfile
 import urllib.request
 import urllib.parse
 from typing import List, Dict, Any, Optional
@@ -26,6 +28,113 @@ except ImportError:
 logger = logging.getLogger("freebuff.proxy_manager")
 
 BASE_INBOUND_PORT = int(os.environ.get("FREEBUFF_BASE_PROXY_PORT", "20000"))
+SINGBOX_CHECK_TIMEOUT_SECONDS = 10
+SINGBOX_STARTUP_GRACE_SECONDS = 0.2
+PROXY_HOST_LOOKUP_TIMEOUT_SECONDS = 5
+
+
+def _resolve_proxy_host(host: str) -> set[str]:
+    """Bound the system resolver without leaving a blocked resolver thread behind."""
+    lookup = (
+        "import json, socket, sys; "
+        "print(json.dumps(sorted({item[4][0] for item in "
+        "socket.getaddrinfo(sys.argv[1], None, type=socket.SOCK_STREAM)})))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", lookup, host],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=PROXY_HOST_LOOKUP_TIMEOUT_SECONDS, check=True,
+        )
+        addresses = json.loads(result.stdout)
+        if not isinstance(addresses, list) or not addresses:
+            raise ValueError
+        return {str(ipaddress.ip_address(address)) for address in addresses}
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        raise ValueError("FREEBUFF_PROXY_HOST could not be resolved within five seconds") from None
+
+
+@dataclass(frozen=True)
+class LocalProxyEndpoint:
+    """One validated address pair for both the listener and worker proxy URLs."""
+
+    listen_ip: str = "127.0.0.1"
+    host: str = "127.0.0.1"
+
+    @classmethod
+    def from_environment(cls) -> "LocalProxyEndpoint":
+        listen_raw = os.environ.get("FREEBUFF_PROXY_LISTEN_IP") or "127.0.0.1"
+        try:
+            listen = ipaddress.ip_address(listen_raw)
+            if not listen.is_loopback or "%" in listen_raw:
+                raise ValueError
+        except ValueError:
+            raise ValueError("FREEBUFF_PROXY_LISTEN_IP must be a loopback IP address") from None
+
+        host = os.environ.get("FREEBUFF_PROXY_HOST") or str(listen)
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        try:
+            host_ip = ipaddress.ip_address(host)
+        except ValueError:
+            # Reject URLs, ports, userinfo, whitespace and non-ASCII names before
+            # invoking the resolver. Operators can supply IDNA names as punycode.
+            labels = host.removesuffix(".").split(".")
+            if len(host) > 253 or not all(
+                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError("FREEBUFF_PROXY_HOST must be an IP address or hostname, without a port or scheme") from None
+            host = host.lower()
+            addresses = _resolve_proxy_host(host)
+        else:
+            host = str(host_ip)
+            addresses = {host}
+
+        if addresses != {str(listen)}:
+            raise ValueError("FREEBUFF_PROXY_HOST must resolve only to FREEBUFF_PROXY_LISTEN_IP")
+        return cls(listen_ip=str(listen), host=host)
+
+    def url_for_port(self, port: int) -> str:
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("Local proxy port must be an integer between 1 and 65535")
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host}:{port}"
+
+
+def validate_proxy_url(value: str) -> str:
+    """Validate an explicit proxy endpoint without echoing its credentials."""
+    try:
+        if not value or any(c.isspace() or ord(c) < 32 for c in value):
+            raise ValueError
+        parsed = urllib.parse.urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https", "socks", "socks5", "socks5h"}
+            or not parsed.hostname
+            or parsed.path not in ("", "/")
+            or parsed.query or parsed.fragment
+            or (parsed.port is not None and not 1 <= parsed.port <= 65535)
+        ):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("Proxy must be a valid HTTP(S) or SOCKS5 endpoint URL") from None
+    return value
+
+
+def redact_proxy_url(value: Optional[str]) -> Optional[str]:
+    """Expose endpoint identity while keeping userinfo and other URL secrets private."""
+    if not value:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        host = parsed.hostname
+        if not host:
+            return "[invalid proxy]"
+        host = f"[{host}]" if ":" in host else host
+        endpoint = f"{host}:{parsed.port}" if parsed.port is not None else host
+        return urllib.parse.urlunsplit((parsed.scheme, endpoint, "", "", ""))
+    except (TypeError, ValueError):
+        return "[invalid proxy]"
 
 class ProxyNode:
     """Represents a parsed proxy node from a subscription or direct URI."""
@@ -85,8 +194,8 @@ class SubscriptionParser:
                             nodes.append(node)
                     if nodes:
                         return nodes
-            except Exception as e:
-                logger.debug(f"Failed to parse as Clash YAML: {e}")
+            except Exception:
+                logger.debug("Failed to parse subscription as Clash YAML.")
 
         # 2. Try Base64 decode (standard V2Ray format)
         decoded = None
@@ -264,8 +373,8 @@ class SubscriptionParser:
                 if uri.startswith("https://"):
                     raw["tls"] = {"enabled": True}
                 return ProxyNode(name=name, protocol="http", server=parsed.hostname, port=parsed.port or (443 if uri.startswith("https://") else 80), raw_config=raw)
-        except Exception as e:
-            logger.debug(f"Failed to parse URI '{uri[:30]}...': {e}")
+        except Exception:
+            logger.debug("Failed to parse proxy URI.")
         return None
 
 
@@ -273,52 +382,67 @@ class ProxyManager:
     """Orchestrates Sing-box instance, parses subscriptions, and manages local proxy inbounds."""
 
     def __init__(self, singbox_bin: Optional[str] = None):
-        self.singbox_bin = (
-            singbox_bin or
-            shutil.which("sing-box") or
-            "/opt/homebrew/bin/sing-box" or
-            "/usr/local/bin/sing-box" or
-            "/usr/bin/sing-box"
-        )
+        candidates = [singbox_bin] if singbox_bin else [
+            shutil.which("sing-box"), "/opt/homebrew/bin/sing-box",
+            "/usr/local/bin/sing-box", "/usr/bin/sing-box",
+        ]
+        self.singbox_bin = next((
+            path for path in candidates
+            if path and os.path.isfile(path) and os.access(path, os.X_OK)
+        ), None)
         self.nodes: List[ProxyNode] = []
         self.active_inbounds: Dict[int, str] = {}  # port -> outbound node tag
+        self._pending_inbounds: Dict[int, str] = {}
         self.process: Optional[subprocess.Popen] = None
-        self.config_path = "/tmp/freebuff_singbox_runtime.json"
-        self._lock = asyncio.Lock()
+        self.config_path: Optional[str] = None
+        self.local_endpoint = LocalProxyEndpoint()
+
+    @property
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
 
     def fetch_subscription(self, url: str) -> List[ProxyNode]:
         """Fetches and parses a remote subscription URL."""
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "ClashMeta/1.18.0 sing-box/1.14.0 FreebuffGateway/1.0"
-            }
-        )
+        self.nodes = []
         try:
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError("Invalid subscription endpoint")
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "ClashMeta/1.18.0 sing-box/1.14.0 FreebuffGateway/1.0"},
+            )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 content = resp.read().decode('utf-8', errors='ignore')
                 self.nodes = SubscriptionParser.parse_subscription_content(content)
                 logger.info(f"Successfully fetched {len(self.nodes)} proxy nodes from subscription.")
                 return self.nodes
-        except Exception as e:
-            logger.error(f"Failed to fetch subscription from '{url}': {e}")
+        except Exception:
+            # URLs and exception text can contain subscription tokens/passwords.
+            self.nodes = []
+            logger.error("Failed to fetch or parse proxy subscription.")
             return []
 
     def set_nodes(self, nodes: List[ProxyNode]):
         self.nodes = nodes
 
     def find_node(self, filter_pattern: Optional[str] = None) -> Optional[ProxyNode]:
-        """Finds a matching node by regex/substring, or falls back to first node."""
+        """Select the first node only when no filter was requested; fail closed otherwise."""
         if not self.nodes:
             return None
-        if not filter_pattern:
+        if filter_pattern is None:
             return self.nodes[0]
-
-        pattern = re.compile(filter_pattern, re.IGNORECASE)
+        if not filter_pattern.strip():
+            return None
+        try:
+            pattern = re.compile(filter_pattern, re.IGNORECASE)
+        except re.error:
+            logger.warning("Invalid proxy node filter; no node selected.")
+            return None
         for node in self.nodes:
             if pattern.search(node.name) or pattern.search(node.protocol):
                 return node
-        return self.nodes[0]
+        return None
 
     def build_singbox_config(self, account_bindings: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -327,14 +451,18 @@ class ProxyManager:
         account_bindings: list of {"port": 20001, "node": ProxyNode}
         """
         inbounds = []
-        outbounds = [{"type": "direct", "tag": "direct"}]
+        outbounds = []
         rules = []
 
-        seen_nodes = set()
-        self.active_inbounds.clear()
+        self._pending_inbounds.clear()
+        endpoint = LocalProxyEndpoint.from_environment()
+        pending_inbounds = {}
 
         for idx, binding in enumerate(account_bindings):
             port = binding["port"]
+            endpoint.url_for_port(port)
+            if port in pending_inbounds:
+                raise ValueError("Local proxy inbound ports must be unique")
             node: ProxyNode = binding["node"]
             in_tag = f"in_acc_{idx + 1}"
             out_tag = f"out_node_{idx + 1}_{node.protocol}"
@@ -342,7 +470,7 @@ class ProxyManager:
             inbounds.append({
                 "type": "mixed",
                 "tag": in_tag,
-                "listen": "127.0.0.1",
+                "listen": endpoint.listen_ip,
                 "listen_port": port
             })
 
@@ -352,7 +480,7 @@ class ProxyManager:
                 "outbound": out_tag
             })
 
-            self.active_inbounds[port] = node.name
+            pending_inbounds[port] = node.name
 
         config = {
             "log": {
@@ -365,46 +493,81 @@ class ProxyManager:
                 "rules": rules
             }
         }
+        self.local_endpoint = endpoint
+        self._pending_inbounds = pending_inbounds
         return config
 
+    def local_proxy_url(self, port: int) -> str:
+        """Use the same validated endpoint snapshot as the generated config."""
+        return self.local_endpoint.url_for_port(port)
+
     def start_singbox(self, config: Dict[str, Any]) -> bool:
-        """Writes configuration and starts the Sing-box daemon process."""
-        if not self.singbox_bin or not os.path.exists(self.singbox_bin):
-            logger.warning(f"sing-box binary not found at '{self.singbox_bin}'. Local proxy daemon disabled.")
-            return False
-
+        """Start a validated daemon and report failure before any worker is launched."""
+        pending_inbounds = dict(self._pending_inbounds)
         self.stop_singbox()
-
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-
-        # Validate config first
-        check = subprocess.run([self.singbox_bin, "check", "-c", self.config_path], capture_output=True, text=True)
-        if check.returncode != 0:
-            logger.error(f"Invalid Sing-box configuration: {check.stderr}")
+        if not self.singbox_bin or not os.path.isfile(self.singbox_bin) or not os.access(self.singbox_bin, os.X_OK):
+            logger.warning("Executable sing-box binary not found; required proxies are unavailable.")
             return False
+        try:
+            descriptor, self.config_path = tempfile.mkstemp(prefix="freebuff-singbox-", suffix=".json")
+            with os.fdopen(descriptor, "w", encoding="utf-8") as config_file:
+                os.fchmod(config_file.fileno(), 0o600)
+                json.dump(config, config_file, indent=2)
 
-        logger.info(f"Starting Sing-box daemon with {len(self.active_inbounds)} inbounds...")
-        self.process = subprocess.Popen(
-            [self.singbox_bin, "run", "-c", self.config_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
-        )
-        return True
+            check = subprocess.run(
+                [self.singbox_bin, "check", "-c", self.config_path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=SINGBOX_CHECK_TIMEOUT_SECONDS,
+            )
+            if check.returncode != 0:
+                logger.error("Sing-box configuration validation failed.")
+                self.stop_singbox()
+                return False
+
+            self.process = subprocess.Popen(
+                [self.singbox_bin, "run", "-c", self.config_path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            try:
+                self.process.wait(timeout=SINGBOX_STARTUP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                if self.is_running:
+                    self.active_inbounds = pending_inbounds
+                    logger.info("Sing-box daemon started with %s inbounds.", len(self.active_inbounds))
+                    return True
+            logger.error("Sing-box exited during startup.")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            logger.error("Sing-box validation or startup failed.")
+        self.stop_singbox()
+        return False
 
     def stop_singbox(self):
-        """Stops the running Sing-box daemon cleanly."""
-        if self.process:
+        """Reap the owned daemon before discarding its handle or private configuration."""
+        if self.process is not None:
+            process = self.process
             try:
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            except ProcessLookupError:
+                process.wait(timeout=2)
+            # If reaping fails, retain the handle and propagate to pool maintenance.
             self.process = None
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
             logger.info("Sing-box daemon stopped.")
+        self.active_inbounds.clear()
+        if self.config_path is not None:
+            try:
+                os.unlink(self.config_path)
+            except FileNotFoundError:
+                pass
+            self.config_path = None
 
 
 # Global singleton proxy manager

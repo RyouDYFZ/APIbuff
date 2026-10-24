@@ -11,8 +11,10 @@ ENV PORT=8000
 ENV FREEBUFF_WORKER_WORKDIR=/workspace
 ENV FREEBUFF_SPAWN_MODE=detached_zsh
 ENV SHELL=/bin/zsh
+ENV FREEBUFF_BIN=/root/.config/manicode/freebuff
+ENV FREEBUFF_HARDWARE_PRIVACY=auto
 
-# 1. Install base utilities, Zsh, Git, Node.js, Procps & Sing-box multi-protocol proxy engine
+# 1. Install base utilities, Zsh, Git, Node.js, Procps, GCC & Sing-box multi-protocol proxy engine
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     npm \
@@ -22,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     tar \
     ca-certificates \
+    gcc \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/* \
     && ARCH=$(uname -m) \
     && if [ "$ARCH" = "x86_64" ]; then SB_ARCH="amd64"; elif [ "$ARCH" = "aarch64" ]; then SB_ARCH="arm64"; else SB_ARCH="amd64"; fi \
@@ -45,8 +49,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 4. Copy application source
 COPY . /app/
 
-# Ensure entrypoint and helper scripts are executable
-RUN chmod +x /app/entrypoint.sh /app/start.sh /app/stop.sh /app/login.sh 2>/dev/null || true
+# Ensure entrypoint and helper scripts are executable, and compile Linux hardware privacy library
+RUN chmod +x /app/entrypoint.sh /app/start.sh /app/stop.sh /app/login.sh 2>/dev/null || true \
+    && if [ -f /app/app/linux_hardware_privacy.c ]; then \
+        gcc -shared -fPIC -O2 -o /app/libhardware_privacy.so /app/app/linux_hardware_privacy.c -ldl; \
+    fi
 
 # 5. Pre-initialize an authentic Git repository in /workspace
 RUN git config --global user.name "Cloud Developer" \
@@ -55,7 +62,7 @@ RUN git config --global user.name "Cloud Developer" \
     && cd /workspace \
     && git init \
     && echo "# Cloud Workspace" > README.md \
-    && echo -e "node_modules/\n*.pyc\n__pycache__/\n.env\n" > .gitignore \
+    && printf "node_modules/\n*.pyc\n__pycache__/\n.env\n" > .gitignore \
     && git add . \
     && git commit -m "Initial commit for cloud workspace"
 

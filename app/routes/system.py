@@ -1,145 +1,145 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+"""Bounded local input diagnostics and coordinated workspace administration."""
+
+import asyncio
 import os
-from ..terminal_env import audit_runtime_environment, get_standard_terminal_env
-from ..jitter import KeystrokeJitterSimulator, JitterConfig
-from ..pool import global_pool
+import tempfile
+from typing import Literal
+
+from fastapi import APIRouter
+from pydantic import BaseModel, Field, model_validator
+
 from ..config import WORKER_WORKDIR
+from ..exceptions import FreebuffException
+from ..jitter import JitterConfig, KeystrokeJitterSimulator, MAX_DELAY_MS, MAX_TARGET_CPS
+from ..pool import global_pool
+from ..terminal_env import audit_runtime_environment
 from ..workspace import get_workspace_git_info
 
 router = APIRouter()
+DIAGNOSTIC_TIMEOUT_SECONDS = 5.0
+MAX_DIAGNOSTIC_CHARS = 4096
+MAX_HUMAN_DIAGNOSTIC_CHARS = 128
+
 
 class SetWorkspaceRequest(BaseModel):
-    path: str
+    path: str = Field(min_length=1, max_length=4096)
 
-class JitterTestRequest(BaseModel):
-    text: str = "Write a python function to compute fibonacci numbers."
-    mode: str = "human"
-    distribution: str = "poisson"
-    min_delay_ms: float = 45.0
-    max_delay_ms: float = 95.0
-    target_max_cps: float = 11.5
-    pre_enter_min_ms: float = 250.0
-    pre_enter_max_ms: float = 500.0
+
+class DiagnosticInputRequest(BaseModel):
+    model_config = {"extra": "forbid", "allow_inf_nan": False}
+    text: str = Field(default="Local typing sample.", max_length=MAX_DIAGNOSTIC_CHARS)
+    mode: Literal["human", "fast", "instant"] = "human"
+    distribution: Literal["poisson", "gaussian", "uniform"] = "poisson"
+    min_delay_ms: float = Field(default=45.0, ge=0, le=MAX_DELAY_MS, strict=True)
+    max_delay_ms: float = Field(default=95.0, ge=0, le=MAX_DELAY_MS, strict=True)
+    target_max_cps: float = Field(default=11.5, ge=1, le=MAX_TARGET_CPS, strict=True)
+    pre_enter_min_ms: float = Field(default=250.0, ge=0, le=MAX_DELAY_MS, strict=True)
+    pre_enter_max_ms: float = Field(default=500.0, ge=0, le=MAX_DELAY_MS, strict=True)
+
+    @model_validator(mode="after")
+    def validate_intervals(self):
+        if self.min_delay_ms > self.max_delay_ms:
+            raise ValueError("min_delay_ms must not exceed max_delay_ms")
+        if self.pre_enter_min_ms > self.pre_enter_max_ms:
+            raise ValueError("pre_enter_min_ms must not exceed pre_enter_max_ms")
+        return self
+
+
+class JitterTestRequest(DiagnosticInputRequest):
+    @model_validator(mode="after")
+    def validate_human_length(self):
+        if self.mode == "human" and len(self.text) > MAX_HUMAN_DIAGNOSTIC_CHARS:
+            raise ValueError(f"Human typing diagnostics allow at most {MAX_HUMAN_DIAGNOSTIC_CHARS} characters")
+        return self
+
+
+async def _capture_input(req: DiagnosticInputRequest, *, paste=False):
+    config = JitterConfig(**req.model_dump(exclude={"text"}))
+    simulator = KeystrokeJitterSimulator(config)
+    operation = simulator.paste_into_fd if paste else simulator.type_into_fd
+    # A bounded local file avoids a pipe filling before its first reader starts.
+    with tempfile.TemporaryFile(mode="w+b") as capture:
+        try:
+            metrics = await asyncio.wait_for(
+                operation(capture.fileno(), req.text, append_return=True),
+                timeout=DIAGNOSTIC_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise FreebuffException(
+                "Local input diagnostic exceeded its time limit.", status_code=504,
+                error_type="timeout_error", error_code="diagnostic_timeout",
+            ) from None
+        capture.seek(0)
+        captured = capture.read()
+    result = metrics.to_dict()
+    result["measurement_scope"] = "local_input_simulation"
+    result["captured_bytes_len"] = len(captured)
+    # Retain the old response field for callers while using a nonblocking sink.
+    result["captured_pipe_bytes_len"] = len(captured)
+    return result, captured
+
 
 @router.get("/v1/system/env-audit")
 @router.get("/system/env-audit")
 async def get_environment_audit():
-    """
-    Audits the execution environment and process tree of the Freebuff CLI worker.
-    Verifies that p=python is eliminated and p=shell (zsh -l) is active.
-    """
-    worker_pid = global_pool.worker.get_freebuff_pid() if (global_pool.worker and global_pool.worker.is_running) else None
-    audit = audit_runtime_environment(worker_pid)
-    audit["worker_running"] = global_pool.worker.is_running if global_pool.worker else False
-    audit["worker_ready"] = global_pool.worker.ready_event.is_set() if global_pool.worker else False
+    """Report the observed environment and process tree, plus local simulations."""
+    worker = global_pool.worker
+    def inspect():
+        pid = worker.get_freebuff_pid() if worker and worker.is_running else None
+        return audit_runtime_environment(pid)
+    audit = await asyncio.to_thread(inspect)
+    audit["worker_running"] = worker.is_running if worker else False
+    audit["worker_ready"] = worker.ready_event.is_set() if worker else False
     return audit
+
 
 @router.post("/v1/system/jitter-test")
 @router.post("/system/jitter-test")
 async def test_keystroke_jitter(req: JitterTestRequest):
-    """
-    Simulates keystroke jitter typing for testing and validation.
-    Returns character intervals, sliding window CPS, composeMs, and the Freebuff wire profile.
-    """
-    config = JitterConfig(
-        mode=req.mode,
-        min_delay_ms=req.min_delay_ms,
-        max_delay_ms=req.max_delay_ms,
-        distribution=req.distribution,
-        target_max_cps=req.target_max_cps,
-        pre_enter_min_ms=req.pre_enter_min_ms,
-        pre_enter_max_ms=req.pre_enter_max_ms
-    )
-    simulator = KeystrokeJitterSimulator(config)
-    
-    # Run test using pipe to record physical timing
-    import os
-    r_fd, w_fd = os.pipe()
-    try:
-        metrics = await simulator.type_into_fd(w_fd, req.text, append_return=True)
-        read_bytes = os.read(r_fd, 65536)
-    finally:
-        os.close(r_fd)
-        os.close(w_fd)
+    """Measure local typing with bounded input and a five-second deadline."""
+    result, _ = await _capture_input(req)
+    result["verified_cps_under_12"] = result["max_cps"] <= 12
+    result["cps_limit_applied"] = req.mode == "human"
+    return result
 
-    res = metrics.to_dict()
-    res["verified_cps_under_12"] = metrics.max_cps <= 12
-    res["captured_pipe_bytes_len"] = len(read_bytes)
-    return res
 
 @router.post("/v1/system/paste-test")
 @router.post("/system/paste-test")
-async def test_bracketed_paste(req: JitterTestRequest):
-    """
-    Tests bracketed paste emulation (\x1b[200~ ... \x1b[201~) for code and multiline inputs.
-    """
-    simulator = KeystrokeJitterSimulator()
-    import os
-    r_fd, w_fd = os.pipe()
-    try:
-        metrics = await simulator.paste_into_fd(w_fd, req.text, append_return=True)
-        read_bytes = os.read(r_fd, 65536)
-    finally:
-        os.close(r_fd)
-        os.close(w_fd)
+async def test_bracketed_paste(req: DiagnosticInputRequest):
+    """Measure a bounded local bracketed-paste simulation."""
+    result, captured = await _capture_input(req, paste=True)
+    result["contains_bracketed_paste_seq"] = captured.startswith(b"\x1b[200~") and captured.endswith(b"\x1b[201~\r")
+    return result
 
-    res = metrics.to_dict()
-    res["contains_bracketed_paste_seq"] = b"\x1b[200~" in read_bytes and b"\x1b[201~" in read_bytes
-    res["captured_pipe_bytes_len"] = len(read_bytes)
-    return res
 
 @router.get("/v1/system/jitter-metrics")
 @router.get("/system/jitter-metrics")
 async def get_latest_jitter_metrics():
-    """
-    Returns the keystroke timing and CPS metrics of the most recent real turn executed by the worker.
-    """
     if not global_pool.worker or not global_pool.worker.last_jitter_metrics:
         return {"status": "no_turns_executed_yet"}
     return global_pool.worker.last_jitter_metrics.to_dict()
 
+
 @router.get("/v1/workspace")
 @router.get("/workspace")
 async def get_active_workspace():
-    """
-    Returns the current active workspace of the Freebuff worker along with its Git repository metadata.
-    """
     cur_workdir = global_pool.worker.workdir if global_pool.worker else WORKER_WORKDIR
-    git_info = get_workspace_git_info(cur_workdir)
+    git_info = await asyncio.to_thread(get_workspace_git_info, cur_workdir)
     return {
         "active_workspace": cur_workdir,
         "basename": os.path.basename(cur_workdir),
-        "git": git_info
+        "git": git_info,
     }
+
 
 @router.post("/v1/workspace")
 @router.post("/workspace")
 async def set_active_workspace(req: SetWorkspaceRequest):
-    """
-    Dynamically switches the active workspace of the Freebuff worker.
-    Restarts the worker inside the new workspace so Freebuff binds to the real project Git context.
-    """
-    target = os.path.abspath(os.path.expanduser(req.path))
-    if not os.path.isdir(target):
-        raise HTTPException(status_code=400, detail=f"Directory does not exist: {target}")
-
-    from ..workspace import is_safe_isolated_path
-    if not is_safe_isolated_path(target):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Access denied: path '{target}' is restricted under strict isolation mode."
-        )
-
-    if global_pool.worker is None:
-        await global_pool.initialize()
-
-    await global_pool.worker.ensure_workspace(target)
-    git_info = get_workspace_git_info(target)
+    target = await global_pool.set_workspace(req.path)
+    git_info = await asyncio.to_thread(get_workspace_git_info, target)
     return {
         "status": "switched",
         "active_workspace": target,
         "basename": os.path.basename(target),
-        "git": git_info
+        "git": git_info,
     }

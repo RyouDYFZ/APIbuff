@@ -1,36 +1,73 @@
 import time
-from typing import List, Optional, Dict, Any, Union
-from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
 from .catalog import catalog_service
+from .config import DEFAULT_MODEL
+from .exceptions import FreebuffException
 
 def resolve_model_id(requested_model: str) -> str:
     """Resolves an incoming model name, slug, or alias to primary slug."""
     resolved = catalog_service.resolve_model(requested_model)
     if resolved:
         return resolved["primarySlug"]
-    return "mimo-v2.6-flash-fast"
+    raise FreebuffException(
+        f"Model '{requested_model}' was not found in the catalog.",
+        status_code=404,
+        error_type="invalid_request_error",
+        error_code="model_not_found",
+    )
 
 # Pydantic models for OpenAI API compatibility
 class ChatMessage(BaseModel):
-    role: str
+    model_config = {"extra": "forbid"}
+    role: Literal["system", "developer", "user", "assistant"]
     content: str
-    name: Optional[str] = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def normalize_text_content(cls, value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            texts = []
+            for part in value:
+                if (
+                    not isinstance(part, dict)
+                    or part.get("type") != "text"
+                    or not isinstance(part.get("text"), str)
+                    or set(part) - {"type", "text"}
+                ):
+                    raise ValueError("Only text content parts are supported; images, audio, and tools are not supported.")
+                texts.append(part["text"])
+            return "".join(texts)
+        raise ValueError("Message content must be a string or an array of text parts; null content is not supported.")
 
 class ChatCompletionRequest(BaseModel):
-    model_config = {"extra": "allow"}
-    model: str = "mimo-v2.6-flash-fast"
-    messages: List[ChatMessage]
+    model_config = {"extra": "forbid"}
+    model: str = DEFAULT_MODEL
+    messages: List[ChatMessage] = Field(min_length=1)
     stream: Optional[bool] = False
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = None
-    presence_penalty: Optional[float] = None
-    frequency_penalty: Optional[float] = None
     workspace: Optional[str] = None
     cwd: Optional[str] = None
     project_dir: Optional[str] = None
     session_id: Optional[str] = None
     reset_context: Optional[bool] = None
-    metadata: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unsupported_parameters(cls, value):
+        if isinstance(value, dict):
+            unsupported = sorted(set(value) - set(cls.model_fields))
+            if unsupported:
+                raise ValueError("Unsupported request parameter(s): " + ", ".join(unsupported))
+        return value
+
+    @field_validator("messages")
+    @classmethod
+    def require_current_user_request(cls, messages):
+        if messages[-1].role != "user" or not messages[-1].content.strip():
+            raise ValueError("The final message must be a non-empty user request; assistant prefill is not supported.")
+        return messages
 
 class ChatCompletionResponseMessage(BaseModel):
     role: str = "assistant"
@@ -53,7 +90,8 @@ class ChatCompletionResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionResponseChoice]
-    usage: UsageInfo = Field(default_factory=UsageInfo)
+    # The CLI adapter does not expose verified per-turn token accounting.
+    usage: Optional[UsageInfo] = None
 
 # Streaming chunk schemas
 class ChatCompletionChunkDelta(BaseModel):
@@ -75,9 +113,9 @@ class ChatCompletionChunk(BaseModel):
 
 # Models endpoint schemas
 class ModelPricingInfo(BaseModel):
-    freebucks_per_hour: Optional[int] = None
+    freebucks_per_hour: Optional[float] = None
     hours_equivalent: Optional[float] = None
-    is_free: bool = False
+    is_free: Optional[bool] = None
     notice: Optional[str] = None
     off_peak: Optional[Dict[str, Any]] = None
 
@@ -87,7 +125,7 @@ class ModelCapabilities(BaseModel):
     efforts: List[str] = Field(default_factory=list)
     default_effort: Optional[str] = None
     access: str = "open"
-    plan_required: bool = False
+    plan_required: Optional[bool] = None
     premium: bool = False
     data_use: str = "service"
     badges: List[str] = Field(default_factory=list)
@@ -103,42 +141,60 @@ class ModelObject(BaseModel):
     aliases: List[str] = Field(default_factory=list)
     pricing: Optional[ModelPricingInfo] = None
     capabilities: Optional[ModelCapabilities] = None
+    status: Optional[str] = None
+    source: Optional[str] = None
+    error: Optional[Any] = None
 
 class ModelList(BaseModel):
     object: str = "list"
     data: List[ModelObject]
+    status: Optional[str] = None
+    source: Optional[str] = None
+    error: Optional[Any] = None
 
 # Pricing and balance schemas
 class DailyAllowanceInfo(BaseModel):
-    limit_freebucks: int
-    limit_hours: float
-    spent_freebucks: int
-    spent_hours: float
-    remaining_freebucks: int
-    remaining_hours: float
+    limit_freebucks: Optional[float] = None
+    limit_hours: Optional[float] = None
+    spent_freebucks: Optional[float] = None
+    spent_hours: Optional[float] = None
+    remaining_freebucks: Optional[float] = None
+    remaining_hours: Optional[float] = None
     reset_at: Optional[str] = None
     reset_timezone: Optional[str] = None
 
 class WalletInfo(BaseModel):
-    balance_freebucks: int
-    balance_hours: float
-    monthly_bonus: int = 0
+    balance_freebucks: Optional[float] = None
+    balance_hours: Optional[float] = None
+    monthly_bonus: Optional[float] = None
 
 class BalanceInfo(BaseModel):
-    total_freebucks: int
-    total_hours: float
-    daily: DailyAllowanceInfo
-    wallet: WalletInfo
+    total_freebucks: Optional[float] = None
+    total_hours: Optional[float] = None
+    daily: Optional[DailyAllowanceInfo] = None
+    wallet: Optional[WalletInfo] = None
     last_refund: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+    source: Optional[str] = None
+    error: Optional[Any] = None
 
 class AccountInfo(BaseModel):
-    access_tier: str
-    country_code: str
-    country_verified: bool
+    access_tier: Optional[str] = None
+    country_code: Optional[str] = None
+    country_verified: Optional[bool] = None
+    status: Optional[str] = None
+    source: Optional[str] = None
+    error: Optional[Any] = None
 
 class PricingResponse(BaseModel):
-    account: AccountInfo
-    balance: BalanceInfo
+    account: Optional[AccountInfo] = None
+    balance: Optional[BalanceInfo] = None
     subscription_tiers: List[Dict[str, Any]] = Field(default_factory=list)
     models_count: int
     models: List[ModelObject]
+    status: Optional[str] = None
+    source: Optional[str] = None
+    error: Optional[Any] = None
+    account_status: Optional[str] = None
+    balance_status: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None

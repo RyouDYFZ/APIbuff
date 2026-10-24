@@ -17,6 +17,11 @@ venv/
 .venv/
 env/
 .env
+.env.*
+!.env.example
+accounts.json
+accounts.*.json
+!accounts.example.json
 
 # Logs & Temporary files
 *.log
@@ -28,3 +33,5 @@ token.json
 credentials.json
 chat-messages.json
 log.jsonl
+/.mimosa
+/reports

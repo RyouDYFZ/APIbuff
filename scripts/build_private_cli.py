@@ -124,23 +124,52 @@ def verify_pinned_archive(archive: Path, target: str, expected_sha: str) -> str:
     return actual
 
 
-class _NoRedirects(urllib.request.HTTPRedirectHandler):
+# The publisher serves releases through its own GitHub repository and GitHub's
+# asset CDN; redirects are confined to these hosts plus the pinned origin.
+# The downloaded archive is still worthless to an attacker: its SHA-256 must
+# match the committed registry before anything is extracted or rebuilt.
+RELEASE_HOSTS = frozenset({
+    "codebuff.com", "www.codebuff.com",
+    "freebuff.com", "www.freebuff.com",
+    "github.com", "www.github.com",
+    "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+})
+# Redirects into GitHub must stay inside the publisher's release repository.
+GITHUB_RELEASE_PATH = "/CodebuffAI/codebuff-community/releases/download/"
+
+
+class _ControlledRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("Release download redirects are not accepted")
+        target = urllib.parse.urlsplit(newurl)
+        if (req.type != "https" or target.scheme != "https"
+                or target.hostname not in RELEASE_HOSTS
+                or (target.hostname in ("github.com", "www.github.com")
+                    and not target.path.startswith(GITHUB_RELEASE_PATH))):
+            raise ValueError(f"Release download redirect to {newurl} is not accepted")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Local VPN clients in fake-ip DNS mode answer every name from this benchmark
+# range; that is the operator's proxy egress, not an internal service.
+_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _is_blocked_address(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
+    return (ip.is_loopback or ip.is_link_local or ip.is_private) and ip not in _FAKE_IP_NETWORK
 
 
 def fetch_release_archive(target: str, destination: Path) -> Path:
-    """Download the pinned release over https from the fixed public host only."""
+    """Download the pinned release over https from the fixed public hosts only."""
     url = f"https://{RELEASE_HOST}/api/releases/download/{FREEBUFF_VERSION}/freebuff-{target}.tar.gz"
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname != RELEASE_HOST:
+    if parsed.scheme != "https" or parsed.hostname not in RELEASE_HOSTS:
         raise ValueError("Release downloads are restricted to the pinned https origin")
     # Resolve now and refuse loopback/private/link-local targets (SSRF guard).
     for _, _, _, _, sockaddr in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM):
-        if not ipaddress.ip_address(sockaddr[0]).is_global:
+        if _is_blocked_address(ipaddress.ip_address(sockaddr[0])):
             raise ValueError("Release host does not resolve to a public address")
     request = urllib.request.Request(url, headers={"User-Agent": "freebuff-private-cli-build/1.0"})
-    opener = urllib.request.build_opener(_NoRedirects)
+    opener = urllib.request.build_opener(_ControlledRedirects)
     with opener.open(request, timeout=300) as response, destination.open("wb") as stream:
         shutil.copyfileobj(response, stream)
     return destination
@@ -258,6 +287,7 @@ def build(target: str, bundle_js: Path, asset_dir: Path, output: Path,
     output = safe_absolute(output, "output")
     if output.exists() or output.with_name(output.name + ".privacy.json").exists():
         raise ValueError("Output already exists; choose a new output path to preserve that build")
+    output.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="freebuff-private-build-") as temporary:
         work = Path(temporary)

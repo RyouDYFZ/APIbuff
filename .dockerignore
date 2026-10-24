@@ -23,3 +23,6 @@ accounts.*.json
 venv
 reports
 .pytest_cache
+.mimosa
+.zcode
+state

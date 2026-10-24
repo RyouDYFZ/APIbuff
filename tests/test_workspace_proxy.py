@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fastapi import HTTPException
+
 from app.accounts import AccountConfig, AccountManager, AccountState
 from app.exceptions import FreebuffException, FreebuffPermissionError
 from app.proxy_manager import ProxyManager, ProxyNode, redact_proxy_url, validate_proxy_url
@@ -184,10 +186,23 @@ class TestRequiredAccountProxies(unittest.TestCase):
 
     def test_successful_daemon_is_required_before_accounts_become_healthy(self):
         self.write_config([{}, {"id": "two"}], "https://subscription.invalid")
-        with patch.object(self.proxy, "fetch_subscription", side_effect=self.fetch_one), patch.object(self.proxy, "start_singbox", return_value=True):
+        second_node = ProxyNode("second-node", "socks", "proxy2.invalid", 1080, {"type": "socks"})
+        with patch.object(self.proxy, "fetch_subscription", side_effect=lambda _url: self.proxy.set_nodes([self.node, second_node]) or self.proxy.nodes), patch.object(self.proxy, "start_singbox", return_value=True):
             accounts = self.manager.load_accounts()
         self.assertEqual(len(self.manager.get_healthy_accounts()), 2)
         self.assertNotEqual(accounts[0].assigned_proxy, accounts[1].assigned_proxy)
+        self.assertNotEqual(accounts[0].assigned_node_name, accounts[1].assigned_node_name)
+
+    def test_one_exit_node_is_never_shared_between_two_accounts(self):
+        # A shared exit IP is both a cross-account correlation signal and the
+        # upstream per-network session-cap trigger.
+        self.write_config([{}, {"id": "two"}], "https://subscription.invalid")
+        with patch.object(self.proxy, "fetch_subscription", side_effect=self.fetch_one), patch.object(self.proxy, "start_singbox", return_value=True):
+            accounts = self.manager.load_accounts()
+        self.assertEqual(accounts[0].status, "idle")
+        self.assertEqual(accounts[1].status, "proxy_error")
+        self.assertIn("already assigned to another account", accounts[1].last_error)
+        self.assertEqual(len(self.manager.get_healthy_accounts()), 1)
 
     def test_explicit_proxy_is_usable_even_when_unrelated_subscription_fails(self):
         endpoint = "http://private-user:private-password@127.0.0.1:1080"
@@ -343,6 +358,10 @@ class TestProxyManagerLifecycle(unittest.TestCase):
 
 
 class TestAccountMaintenanceRoutes(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from app.routes import accounts as routes
+        routes._last_admin_action["at"] = 0.0
+
     async def test_reload_and_refresh_only_call_coordinated_pool_reload(self):
         from app.routes import accounts as routes
         pool = SimpleNamespace(reload=AsyncMock())
@@ -350,10 +369,22 @@ class TestAccountMaintenanceRoutes(unittest.IsolatedAsyncioTestCase):
         proxy = SimpleNamespace(nodes=[], active_inbounds={}, fetch_subscription=Mock())
         with patch.object(routes, "global_pool", pool), patch.object(routes, "global_account_manager", manager), patch.object(routes, "global_proxy_manager", proxy):
             self.assertEqual((await routes.reload_accounts())["status"], "success")
+            routes._last_admin_action["at"] = 0.0  # Reset the maintenance throttle.
             self.assertEqual((await routes.refresh_proxies())["status"], "success")
         self.assertEqual(pool.reload.await_count, 2)
         manager.load_accounts.assert_not_called()
         proxy.fetch_subscription.assert_not_called()
+
+    async def test_maintenance_actions_are_throttled(self):
+        from app.routes import accounts as routes
+        pool = SimpleNamespace(reload=AsyncMock())
+        manager = SimpleNamespace(accounts={}, subscription_url="https://subscription.invalid")
+        with patch.object(routes, "global_pool", pool), patch.object(routes, "global_account_manager", manager):
+            self.assertEqual((await routes.reload_accounts())["status"], "success")
+            with self.assertRaises(HTTPException) as throttled:
+                await routes.reload_accounts()
+            self.assertEqual(throttled.exception.status_code, 429)
+        self.assertEqual(pool.reload.await_count, 1)
 
     async def test_reload_preserves_typed_maintenance_errors(self):
         from app.routes import accounts as routes

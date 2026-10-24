@@ -28,7 +28,7 @@ services:
       - FREEBUFF_SUPERVISOR_PS_SHIM=${FREEBUFF_SUPERVISOR_PS_SHIM:-true}
       - CODEBUFF_SHIP_LOGS=false
       - FREEBUFF_SANDBOX_DIR=/var/lib/freebuff/accounts
-      - FREEBUFF_BIN=${FREEBUFF_BIN:-/root/.config/manicode/freebuff}
+      - FREEBUFF_BIN=${FREEBUFF_BIN:-/opt/freebuff/private-cli/freebuff}
       - FREEBUFF_HARDWARE_PRIVACY=${FREEBUFF_HARDWARE_PRIVACY:-auto}
       - PORT=8000
       
@@ -37,7 +37,6 @@ services:
       - FREEBUFF_PROXY_HOST=${FREEBUFF_PROXY_HOST:-proxy.internal}
       - SUBSCRIPTION_URL=${SUBSCRIPTION_URL:-}
       - FREEBUFF_ACCOUNTS_FILE=${FREEBUFF_ACCOUNTS_FILE:-accounts.json}
-      - FREEBUFF_LOAD_BALANCE_STRATEGY=${FREEBUFF_LOAD_BALANCE_STRATEGY:-least_busy}
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=localhost,127.0.0.1

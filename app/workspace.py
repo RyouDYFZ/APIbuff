@@ -25,14 +25,26 @@ def sanitize_host_paths(text: str, replacement_root: str = "/workspace") -> str:
     Scrubs host user paths (e.g. /Users/<username>/..., /home/<username>/..., C:\\Users\\<username>\\...)
     from text to prevent client prompts (Cursor, Cline, Continue) from leaking personal
     identities, system usernames, or host repository locations to the upstream LLM/CLI.
+
+    Usernames may contain any non-separator character (including non-ASCII and
+    spaces); only the separator itself ends the match.
     """
     if not text:
         return text
-    # Match /Users/<username> or /home/<username>
-    scrubbed = re.sub(r'/(?:Users|home)/[a-zA-Z0-9_\-\.]+([/\s\'"`])', f'{replacement_root}\\1', text)
-    scrubbed = re.sub(r'/(?:Users|home)/[a-zA-Z0-9_\-\.]+$', replacement_root, scrubbed)
-    # Match Windows C:\Users\<username>
-    scrubbed = re.sub(r'[a-zA-Z]:\\Users\\[a-zA-Z0-9_\-\.]+', replacement_root, scrubbed)
+    # /Users/<username> and /home/<username>: the username is anything up to
+    # the next separator or boundary punctuation (covers non-ASCII and spaces);
+    # the remainder of the path is preserved after the replacement root.
+    scrubbed = re.sub(
+        r'/(?:Users|home)/[^\s/\'"<>`]+(?=[/\s\'"<>`]|$)',
+        replacement_root,
+        text,
+    )
+    # Windows C:\Users\<username>
+    scrubbed = re.sub(
+        r'[a-zA-Z]:\\+Users\\+[^\s\\/\'"<>`]+',
+        replacement_root,
+        scrubbed,
+    )
     return scrubbed
 
 def allowed_workspace_roots() -> List[str]:

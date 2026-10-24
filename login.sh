@@ -7,6 +7,11 @@ cd "$DIR"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
+# Prefer the verified private CLI: the official binary ships active PostHog
+# telemetry even for `login`. Fall back to the launcher only when no private
+# build exists yet (run scripts/build_private_cli.py first).
+PRIVATE_BIN="${FREEBUFF_BIN:-$DIR/.freebuff/private-cli/freebuff}"
+
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^freebuff-api-gateway$"; then
     echo "============================================================"
     echo "    Freebuff Container OAuth Login"
@@ -18,10 +23,15 @@ else
     echo "============================================================"
     echo "    Freebuff Native CLI OAuth Login"
     echo "============================================================"
-    if command -v freebuff >/dev/null 2>&1; then
+    if [ -x "$PRIVATE_BIN" ]; then
+        "$PRIVATE_BIN" login
+    elif command -v freebuff >/dev/null 2>&1; then
+        echo "⚠️  Using the official CLI: build a private one with"
+        echo "    python3 scripts/build_private_cli.py --fetch"
         freebuff login
     else
-        echo "❌ freebuff CLI not found. Run 'npm install -g freebuff' first."
+        echo "❌ freebuff CLI not found. Build the private CLI with:"
+        echo "   python3 scripts/build_private_cli.py --fetch"
         exit 1
     fi
 fi

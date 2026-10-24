@@ -291,7 +291,8 @@ class PoolSessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await active
         self.assertFalse(worker.is_running)
-        self.assertEqual(account.status, "error")
+        self.assertEqual(account.status, "cooling")
+        self.assertTrue(account.is_cooling)
         self.assertEqual(account.active_turns, 0)
         self.assertFalse(self.pool._leased_accounts)
         self.assertNotIn("A", self.pool.active_session_account)
@@ -343,7 +344,8 @@ class PoolSessionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FreebuffTimeoutError):
                 await active
         self.assertFalse(worker.is_running)
-        self.assertEqual(account.status, "error")
+        self.assertEqual(account.status, "cooling")
+        self.assertTrue(account.is_cooling)
         self.assertEqual((account.active_turns, account.failed_requests), (0, 1))
         self.assertFalse(self.pool._leased_accounts)
 
@@ -375,7 +377,7 @@ class PoolSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.active_turns, 0)
 
     async def test_refusals_and_server_failures_never_retry_another_account(self):
-        for status, expected in ((401, "auth_error"), (402, "payment_error"), (403, "permission_error"), (429, "rate_limited"), (502, "error")):
+        for status, expected in ((401, "auth_error"), (402, "payment_error"), (403, "permission_error"), (429, "rate_limited"), (502, "cooling")):
             with self.subTest(status=status):
                 self.pool = MultiAccountWorkerPool()
                 self.manager.accounts.clear()

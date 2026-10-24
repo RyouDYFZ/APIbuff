@@ -10,9 +10,9 @@ const { syncBuiltinESMExports } = require('node:module')
 const { promisify } = require('node:util')
 const identity = JSON.parse(fs.readFileSync(path.join(__dirname, 'identity.json'), 'utf8'))
 if (!/^[A-F0-9-]{36}$/i.test(identity.uuid) ||
-    !/^[A-F0-9]{12}$/.test(identity.serial) ||
+    !/^[A-HJ-NP-Z0-9]{12}$/.test(identity.serial) ||
     (identity.machine_id && !/^[a-f0-9]{32}$/.test(identity.machine_id)) ||
-    identity.hostname !== 'developer-workstation.local') {
+    !/^[a-z0-9][a-z0-9-]{0,30}\.local$/.test(identity.hostname)) {
   throw new Error('Invalid worker hardware privacy profile')
 }
 if (!identity.machine_id) {

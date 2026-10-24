@@ -1,0 +1,19 @@
+{
+  "version": "0.2.34",
+  "source": "SHA-256 of every official freebuff@0.2.34 release archive, mirrored from the npm package's binaryChecksums field (a trust root separate from this repository), plus the extracted JavaScript bundle digest per target. A private-build receipt naming these digests pins its provenance transitively.",
+  "sha256": {
+    "darwin-arm64": "4af7a5edbf4dd8190043e43ea4d195fdefd10c92a416b574dbb3f555b004fdf3",
+    "darwin-x64": "6a01ca258821d04a63877ee32a434cb7ac31cc42e66695563846723fdb43ac3a",
+    "darwin-x64-baseline": "60b5758718bb4f2e7db4d75113fec368f41610f9bc67dd0b0e7af871424f2a3d",
+    "linux-arm64": "a34ef364933496ab6eec21e22355df9c84ad81b847f51a883b19b2e4866f0dd9",
+    "linux-x64": "5d9f18b5a56ac80e457547ca3859766a28fd8ddd32c396492f2cdb28b92507e2",
+    "linux-x64-baseline": "97a348e01ca780d3a51e1c0981e9e8d8f5f7d4e5cee9f3342fe2245c0017522d",
+    "win32-x64": "202d1174460b6271d87d9bb752505d47b321a957cee88b521858d0abed8a8a859",
+    "win32-x64-baseline": "cf57808f762d97e4a4e830e06cee44d28cdfba99b4d6421013ce38f52c047fa"
+  },
+  "bundle_sha256": {
+    "darwin-arm64": "c19723acf4d76aee80d2da6f31ee1d5850d255e42f6e32a462612e44248cbadf",
+    "linux-x64": "304be55e2b523654d567ef02c572c69429da412e7dd818cdff8a51269d8df55a",
+    "linux-arm64": "ddc7bdeb3135b7c891edcb68857849c292802d25215978e67899d92c30cd3d5c"
+  }
+}

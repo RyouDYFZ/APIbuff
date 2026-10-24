@@ -5,6 +5,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from app.process_view import (
     supervisor_ps_shim_enabled, supervisor_terminal_view_enabled,
 )
 from app.terminal_env import audit_runtime_environment, bucket_process_name
-from app.worker import FreebuffWorker
+from app.worker import FreebuffWorker, _terminal_geometry
 
 
 class ProcessViewConfigurationTests(unittest.TestCase):
@@ -157,7 +158,8 @@ class PsWrapperTests(unittest.TestCase):
 def make_probe(directory, *, launcher=False):
     report = directory / "process-view.json"
     cli = directory / "probe cli's executable"
-    cli.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""
+    cli_impl = directory / "probe_cli_impl.py"
+    cli_impl.write_text(textwrap.dedent(f"""
         import json, os, shutil, subprocess, sys, time
         from pathlib import Path
         def read(pid, system=False):
@@ -189,14 +191,23 @@ def make_probe(directory, *, launcher=False):
         print('Enter a coding task', flush=True)
         time.sleep(60)
     """))
+    cli.write_text(
+        "#!/bin/sh\n"
+        f'exec {shlex.quote(sys.executable)} {shlex.quote(str(cli_impl))} "$@"\n'
+    )
     cli.chmod(0o700)
     if launcher:
         wrapper = directory / "probe launcher"
-        wrapper.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""
+        wrapper_impl = directory / "probe_launcher_impl.py"
+        wrapper_impl.write_text(textwrap.dedent(f"""
             import os, subprocess, sys
             os.environ['CODEBUFF_LAUNCHER_PID'] = str(os.getpid())
             raise SystemExit(subprocess.call([{str(cli)!r}, *sys.argv[1:]]))
         """))
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'exec {shlex.quote(sys.executable)} {shlex.quote(str(wrapper_impl))} "$@"\n'
+        )
         wrapper.chmod(0o700)
         return wrapper, report
     return cli, report
@@ -234,7 +245,7 @@ class WorkerProcessViewTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(bucket_process_name(data["actual_grandparent"]), system_kind)
                     self.assertEqual(data["launcher"], launcher)
                     self.assertEqual(data["isatty"], [True, True, True])
-                    self.assertEqual(data["size"], [120, 40])
+                    self.assertEqual(data["size"], list(_terminal_geometry(worker.account_id)))
                     if enabled and sys.platform == "darwin":
                         self.assertEqual(data["ps"], str(SHIM_DIR / "ps"))
                     if sys.platform == "linux":

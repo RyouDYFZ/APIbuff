@@ -23,6 +23,11 @@ def _token(value):
     return value.strip() if isinstance(value, str) and value.strip() not in ("", "unauthenticated") else None
 
 
+def _live_diagnostics_enabled() -> bool:
+    """Opt-in: /me would otherwise expose the token from the gateway host IP."""
+    return os.getenv("FREEBUFF_LIVE_CATALOG", "false").strip().lower() in ("1", "true")
+
+
 def read_auth_context(config_dir: Optional[str] = None) -> Dict[str, Any]:
     """Use only this profile's inline token or an explicitly supplied env token.
 
@@ -87,10 +92,18 @@ def verify_token(force: bool = False) -> Dict[str, Any]:
                 status="unknown" if context["source"] == "keychain_unavailable" else "missing",
                 message="The configured profile has no readable inline token; keychain pointers are not resolved by this gateway.",
             )
+        elif not _live_diagnostics_enabled():
+            result.update(
+                status="disabled",
+                message="Identity diagnostics are offline by default; set FREEBUFF_LIVE_CATALOG=true to enable the direct /me check.",
+            )
         else:
+            target = API_HOST + "/api/v1/me?fields=id,email"
+            if not target.startswith("https://www.codebuff.com/"):
+                raise ValueError("Identity diagnostics must use the pinned https API host")
             try:
                 response = requests.get(
-                    API_HOST + "/api/v1/me?fields=id,email",
+                    target,
                     headers={"Authorization": f"Bearer {token}", "User-Agent": "freebuff-api-gateway/1.0"},
                     timeout=2.5,
                 )

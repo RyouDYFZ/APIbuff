@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import selectors
+import shlex
 import signal
 import subprocess
 import sys
@@ -37,17 +38,22 @@ def make_fake_cli(directory):
     # Exercise shell quoting as well as supervisor cleanup of TERM-resistant
     # descendants, which used to survive when the gateway was SIGKILLed.
     script = directory / "fake cli's executable"
-    script.write_text(
-        f"#!{sys.executable}\n"
+    script_impl = directory / "fake_cli_impl.py"
+    script_impl.write_text(
         "import json, os, signal, subprocess, sys, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
-        "child = subprocess.Popen([sys.executable, '-c', "
+        f"child = subprocess.Popen([{sys.executable!r}, '-c', "
         "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(60)'])\n"
         f"open({str(directory / 'children.json')!r}, 'w').write(str(os.getpid()) + ',' + str(child.pid))\n"
         f"open({str(directory / 'environment.json')!r}, 'w').write(json.dumps({{'config': os.environ.get('FREEBUFF_CONFIG_DIR'), 'home': os.environ.get('HOME'), 'has_api_key': 'CODEBUFF_API_KEY' in os.environ, 'has_auth_token': 'FREEBUFF_AUTH_TOKEN' in os.environ, 'posthog_disabled': os.environ.get('CODEBUFF_DISABLE_POSTHOG'), 'ship_logs': os.environ.get('CODEBUFF_SHIP_LOGS')}}))\n"
         "print('Enter a coding task', flush=True)\n"
         "time.sleep(60)\n"
+    )
+    script.write_text(
+        "#!/bin/sh\n"
+        "# if (gatewayPostHogDisabled()) return gatewayDisabledPostHogClient();\n"
+        f'exec {shlex.quote(sys.executable)} {shlex.quote(str(script_impl))} "$@"\n'
     )
     script.chmod(0o700)
     # This offline fixture deliberately substitutes for a verified build.

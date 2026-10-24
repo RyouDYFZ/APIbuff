@@ -21,6 +21,22 @@ logger = logging.getLogger("freebuff.catalog")
 
 FREEBUFF_PER_HOUR = 5
 
+
+def live_catalog_enabled() -> bool:
+    """Upstream catalog/session lookups are opt-in.
+
+    They would otherwise call codebuff.com directly from the gateway host
+    (python-requests user agent, no per-account proxy), exposing the default
+    account token from a second IP and outside the CLI's request shape.
+    """
+    return os.getenv("FREEBUFF_LIVE_CATALOG", "false").strip().lower() in ("1", "true")
+
+
+def validate_upstream_url(url: str) -> None:
+    """Only https requests to the fixed public API host are allowed."""
+    if not url.startswith("https://www.codebuff.com/"):
+        raise ValueError("Upstream catalog requests must use the pinned https API host")
+
 # Local reference catalog. Prices and account eligibility are not verified.
 DEFAULT_FALLBACK_CATALOG = {
     "rows": [
@@ -442,12 +458,22 @@ class FreebuffCatalogService:
             self._cached_session = None
             self._source = "local_fallback"
             self._error = None
+            if not live_catalog_enabled():
+                # Offline by default: never call codebuff.com from the gateway
+                # process; the CLI inside each worker already fetches the live
+                # catalog through its own account proxy.
+                self._error = {"code": "live_catalog_disabled",
+                               "message": "Set FREEBUFF_LIVE_CATALOG=true to query the upstream catalog from this host."}
+                self._cache_time = now
+                return
             try:
                 if not self.token or not self.key_id or self.priv_key is None:
                     self._error = {"code": self._registration_status, "message": "No registered signing key is available for the default credential scope."}
                     return
                 path = "/api/v1/freebuff/models"
-                response = requests.get(self.api_host + path, headers=self._sign_headers("GET", path), timeout=3.5)
+                url = self.api_host + path
+                validate_upstream_url(url)
+                response = requests.get(url, headers=self._sign_headers("GET", path), timeout=3.5)
                 if response.status_code != 200:
                     self._error = {"code": "catalog_unavailable", "http_status": response.status_code}
                     return
@@ -457,9 +483,11 @@ class FreebuffCatalogService:
                     return
                 self._cached_catalog, self._source = catalog, "upstream_catalog"
                 path = "/api/v1/freebuff/session"
+                url = self.api_host + path
+                validate_upstream_url(url)
                 fetch_id = catalog.get("fetchId")
                 response = requests.get(
-                    self.api_host + path,
+                    url,
                     headers=self._sign_headers("GET", path, fetch_id=fetch_id if isinstance(fetch_id, str) else None),
                     timeout=3.5,
                 )

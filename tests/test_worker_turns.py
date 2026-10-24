@@ -23,10 +23,31 @@ from app.exceptions import (
 )
 from app.jitter import JitterMetrics
 from app.response_reader import current_response, read_messages, check_log_error
-from app.worker import FreebuffWorker, validate_turn_prompt
+from app.worker import FreebuffWorker, build_wire_prompt, validate_turn_prompt
+from app.pool import MultiAccountWorkerPool
+from app.models import ChatMessage
 
 
 WIRE_HELLO = "[Current Request]\nhello"
+
+
+class WirePromptTests(unittest.TestCase):
+    def test_serialized_history_is_not_prefixed_twice(self):
+        pool = MultiAccountWorkerPool()
+        messages = [
+            ChatMessage(role="system", content="be brief"),
+            ChatMessage(role="user", content="first question"),
+            ChatMessage(role="assistant", content="first answer"),
+            ChatMessage(role="user", content="current question"),
+        ]
+        serialized = validate_turn_prompt(pool.format_messages(messages, is_new_session=True))
+        wire = build_wire_prompt(serialized)
+        self.assertEqual(wire.count("[Current Request]"), 1)
+        # The serialized form already carries its own section markers.
+        self.assertEqual(wire, serialized)
+        self.assertTrue(wire.startswith("[System Instructions]"))
+        # Raw prompts (daemon path) still get exactly one marker.
+        self.assertEqual(build_wire_prompt("hello"), WIRE_HELLO)
 
 
 def user(message_id="user-new", prompt=WIRE_HELLO):

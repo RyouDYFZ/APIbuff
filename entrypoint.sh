@@ -22,51 +22,22 @@ else:
     print("No upstream token supplied; existing login files are preserved.")
 PY_CREDENTIALS
 
-# 2. Binary Verification
-if [ ! -f "$CONFIG_DIR/freebuff" ]; then
-    echo "Fetching Freebuff native binary..."
-    freebuff --version || true
-fi
-
-# Ensure privacy receipt exists for the Linux native binary so verify_private_cli passes
-if [ -f "$CONFIG_DIR/freebuff" ] && [ ! -f "$CONFIG_DIR/freebuff.privacy.json" ]; then
-    python3 - <<'PY_RECEIPT'
-import json
+# 2. Fail closed unless the image carries a genuine private CLI build. The
+#    check verifies the embedded PostHog opt-out patch plus its build receipt;
+#    a receipt generated for an official binary is rejected here, so workers
+#    can never run unverified telemetry-bearing code.
+python3 - <<'PY_VERIFY'
 import os
-from pathlib import Path
-import platform
-from app.cli_build import AUDITED_BUNDLE_SHA256, PRIVACY_BUILD_VERSION, PRIVATE_GUARD, sha256_file
+from app.cli_build import verify_private_cli
 
-config_dir = Path(os.environ.get("CONFIG_DIR", Path.home() / ".config/manicode"))
-binary = config_dir / "freebuff"
-receipt = config_dir / "freebuff.privacy.json"
-if binary.is_file() and not receipt.is_file():
-    metadata = {
-        "privacy_build_version": PRIVACY_BUILD_VERSION,
-        "platform": platform.system().lower(),
-        "machine": platform.machine(),
-        "posthog_switch": "CODEBUFF_DISABLE_POSTHOG",
-        "source_bundle_sha256": AUDITED_BUNDLE_SHA256,
-        "guard_sha256": sha256_file(PRIVATE_GUARD),
-        "binary_sha256": sha256_file(binary),
-    }
-    receipt.write_text(json.dumps(metadata, indent=2))
-    print(f"Generated Linux privacy receipt for {binary}")
-PY_RECEIPT
-fi
+binary = os.environ.get("FREEBUFF_BIN", "/opt/freebuff/private-cli/freebuff")
+verify_private_cli(binary)
+print(f"Verified private Freebuff CLI build (PostHog opt-out embedded): {binary}")
+PY_VERIFY
 
-# 3. Workspace Initialization
+# 3. Workspace root; each account's worker initializes its own Git repository.
 WORKSPACE="${FREEBUFF_WORKER_WORKDIR:-/workspace}"
 mkdir -p "$WORKSPACE"
-if [ ! -d "$WORKSPACE/.git" ]; then
-    cd "$WORKSPACE"
-    git config --global user.name "Cloud Developer" 2>/dev/null || true
-    git config --global user.email "cloud@freebuff.local" 2>/dev/null || true
-    git init -b main 2>/dev/null || git init
-    echo "# Cloud Project Workspace" > README.md
-    git add . 2>/dev/null || true
-    git commit -m "Initial commit" 2>/dev/null || true
-fi
 
 # 4. Bind Host and Port
 APP_HOST="${FREEBUFF_API_HOST:-0.0.0.0}"

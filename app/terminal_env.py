@@ -79,11 +79,13 @@ def get_standard_terminal_env(
     custom_overrides: Optional[Dict[str, str]] = None
 ) -> Dict[str, str]:
     """
-    Constructs an authentic, complete terminal environment dictionary.
-    Inherits standard host variables and injects proper interactive desktop terminal attributes.
-    Supports both macOS and Linux cloud containers seamlessly.
+    Construct a minimal, complete terminal environment dictionary.
+
+    Nothing is inherited from the gateway host except an explicit allowlist:
+    gateway secrets (FREEBUFF_API_KEY), cloud credentials, host identity, and
+    geolocation hints (TZ) must never reach the third-party CLI process.
     """
-    env = os.environ.copy()
+    env: Dict[str, str] = {}
 
     term_prog, term_ver = detect_terminal_program()
 
@@ -102,7 +104,8 @@ def get_standard_terminal_env(
     env["USER"] = "developer"
     env["LOGNAME"] = "developer"
 
-    # Locale and Encoding
+    # Locale and Encoding: inherited only when the host set them (content
+    # language); they are not part of the upstream environment descriptor.
     env["LANG"] = os.environ.get("LANG", "en_US.UTF-8")
     env["LC_ALL"] = os.environ.get("LC_ALL", "en_US.UTF-8")
     env["LC_CTYPE"] = os.environ.get("LC_CTYPE", "en_US.UTF-8")
@@ -122,26 +125,16 @@ def get_standard_terminal_env(
         "/usr/sbin",
         "/sbin",
     ]
-    cur_path = env.get("PATH", "")
+    cur_path = os.environ.get("PATH", "")
     safe_paths = []
     for d in cur_path.split(":"):
-        if d and not d.startswith("/Users/") and not d.startswith("/home/"):
+        if d and not d.startswith("/Users/") and not d.startswith("/home/") and not d.startswith("~"):
             if d not in safe_paths:
                 safe_paths.append(d)
     for d in path_dirs:
         if d not in safe_paths:
             safe_paths.append(d)
     env["PATH"] = ":".join(safe_paths)
-
-    # Host leakage scrubber: purge sensitive macOS and host-identifying environment variables
-    sensitive_prefixes = ("Apple_", "XPC_", "SECURITY", "__CF", "LaunchInstanceID")
-    sensitive_keys = {
-        "ORIGINAL_XDG_CURRENT_DESKTOP", "MallocNanoZone", "COMMAND_MODE",
-        "ITERM_SESSION_ID", "VSCODE_INJECTION", "TERM_SESSION_ID"
-    }
-    for k in list(env.keys()):
-        if any(k.startswith(p) for p in sensitive_prefixes) or k in sensitive_keys:
-            del env[k]
 
     # Do NOT inject CODEBUFF_API_KEY as it overrides the native OAuth keychain session
     # and causes Freebuff to fall back to invalid API key validation.

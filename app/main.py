@@ -1,4 +1,6 @@
+import hmac
 import logging
+import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -6,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
-from .config import API_KEY
+from .config import API_KEY, HOST
 from .pool import global_pool
 from .lifecycle import gateway_control
 from .credentials import default_config_dir, write_cli_credentials
@@ -20,6 +22,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("freebuff.api")
 
+# Binds that cannot be reached from other machines without explicit opt-in.
+LOOPBACK_BIND_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", ""}
+
+
+def enforce_startup_guards() -> None:
+    """Refuse known-unsafe deployments before serving a single request."""
+    if sys.version_info < (3, 11):
+        raise RuntimeError(
+            "The Freebuff gateway requires Python 3.11 or newer: stream cleanup "
+            "uses asyncio.Task.cancelling()."
+        )
+    bind = (HOST or "").strip()
+    if not API_KEY and bind.strip("[]") not in LOOPBACK_BIND_HOSTS:
+        raise RuntimeError(
+            f"Refusing to serve on {bind or '0.0.0.0'} without FREEBUFF_API_KEY: "
+            "the gateway would be unauthenticated on a non-loopback interface. "
+            "Set a strong FREEBUFF_API_KEY (clients send it as the bearer token) "
+            "or bind FREEBUFF_API_HOST=127.0.0.1 for local-only use."
+        )
+    if not API_KEY:
+        logger.warning(
+            "FREEBUFF_API_KEY is empty; serving without authentication because the "
+            "bind address is loopback. Set a key before exposing the gateway."
+        )
+
 def ensure_cloud_credentials():
     """Seed the official CLI profile for an explicitly supplied cloud token."""
     import os
@@ -32,6 +59,7 @@ def ensure_cloud_credentials():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    enforce_startup_guards()
     async with gateway_control():
         try:
             ensure_cloud_credentials()
@@ -52,10 +80,16 @@ app = FastAPI(
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, error: RequestValidationError):
-    first = error.errors()[0]
-    location = ".".join(str(part) for part in first["loc"] if part != "body") or None
+    errors = error.errors()
+    if errors:
+        first = errors[0]
+        location = ".".join(str(part) for part in first.get("loc", ()) if part != "body") or None
+        msg = first.get("msg", "Invalid request")
+    else:
+        location = None
+        msg = "Invalid request"
     return JSONResponse(status_code=422, content={"error": {
-        "message": first["msg"],
+        "message": msg,
         "type": "invalid_request_error",
         "param": location,
         "code": "invalid_request",
@@ -104,7 +138,7 @@ class APIKeyAuthMiddleware:
         request = Request(scope)
         auth_header = request.headers.get("Authorization")
         parts = auth_header.split() if auth_header else []
-        if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1] != API_KEY:
+        if len(parts) != 2 or parts[0].lower() != "bearer" or not hmac.compare_digest(parts[1], API_KEY):
             response = JSONResponse(status_code=401, content={"error": {
                 "message": "Invalid API Key" if auth_header else "Missing Authorization header",
                 "type": "authentication_error",
@@ -116,6 +150,37 @@ class APIKeyAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+# Requests larger than this are rejected before their body is read. The largest
+# legitimate payloads are ultra-long prompts (128k characters plus JSON and
+# history replay), well below this bound.
+MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            for name, value in scope.get("headers", []):
+                if name == b"content-length":
+                    try:
+                        length = int(value)
+                    except ValueError:
+                        length = -1
+                    if length > MAX_REQUEST_BODY_BYTES:
+                        response = JSONResponse(status_code=413, content={"error": {
+                            "message": "Request body exceeds the supported size limit.",
+                            "type": "invalid_request_error",
+                            "param": None,
+                            "code": "request_too_large",
+                        }})
+                        await response(scope, receive, send)
+                        return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(APIKeyAuthMiddleware)
 
 # Added last so CORS wraps authentication: browser preflights do not carry the

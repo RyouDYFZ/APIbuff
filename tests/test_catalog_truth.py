@@ -39,7 +39,7 @@ class CatalogTruthTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name)
-        self.env = patch.dict("os.environ", {}, clear=True)
+        self.env = patch.dict("os.environ", {"FREEBUFF_LIVE_CATALOG": "true"}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
         self.keychain = patch("subprocess.check_output", side_effect=AssertionError("keychain must not be queried"))
@@ -317,7 +317,7 @@ class AuthTruthTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name)
-        self.env = patch.dict("os.environ", {}, clear=True)
+        self.env = patch.dict("os.environ", {"FREEBUFF_LIVE_CATALOG": "true"}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
         self.config = patch.object(auth_probe, "default_config_dir", return_value=str(self.path))
@@ -369,10 +369,19 @@ class PublicAndThreadBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "API_KEY", "protected"), patch.object(health.global_pool, "workers", {"private-account": SimpleNamespace(is_running=True)}), patch.object(health, "verify_token", side_effect=AssertionError("public probe")) as verify, patch.object(auth_probe, "read_auth_context", side_effect=AssertionError("public credentials")) as read, patch("requests.get", side_effect=AssertionError("public network")) as network, patch("subprocess.check_output", side_effect=AssertionError("public keychain")) as keychain:
             result = await ASGIExchange(method="GET", path="/health").run()
         self.assertEqual(result.status, 200)
+        self.assertEqual(result.json["status"], "ok")
         self.assertEqual(set(result.json), {"status", "worker_count", "uptime_seconds"})
         self.assertEqual(result.json["worker_count"], 1)
         for mock in (verify, read, network, keychain):
             mock.assert_not_called()
+
+    async def test_public_health_reports_503_when_no_worker_is_running(self):
+        with patch.object(main, "API_KEY", "protected"), \
+             patch.object(health.global_pool, "workers", {"stalled": SimpleNamespace(is_running=False)}):
+            result = await ASGIExchange(method="GET", path="/health").run()
+        self.assertEqual(result.status, 503)
+        self.assertEqual(result.json["status"], "unhealthy")
+        self.assertEqual(result.json["worker_count"], 0)
 
     async def test_auth_diagnostic_requires_bearer_and_runs_in_thread(self):
         loop_thread = threading.get_ident()

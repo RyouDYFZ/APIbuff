@@ -272,5 +272,24 @@ class DiagnosticRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(thread != main_thread for thread in threads))
 
 
+class StartupGuardTests(unittest.TestCase):
+    def test_exposed_bind_without_api_key_is_refused(self):
+        import app.main as main
+        for host in ("0.0.0.0", "::", "192.168.1.10", "example.com"):
+            with self.subTest(host=host), \
+                 patch.object(main, "HOST", host), patch.object(main, "API_KEY", ""):
+                with self.assertRaisesRegex(RuntimeError, "FREEBUFF_API_KEY"):
+                    main.enforce_startup_guards()
+
+    def test_loopback_without_key_and_any_bind_with_key_are_allowed(self):
+        import app.main as main
+        for host in ("127.0.0.1", "localhost", "::1"):
+            with self.subTest(host=host), \
+                 patch.object(main, "HOST", host), patch.object(main, "API_KEY", ""):
+                main.enforce_startup_guards()
+        with patch.object(main, "HOST", "0.0.0.0"), patch.object(main, "API_KEY", "set-key"):
+            main.enforce_startup_guards()
+
+
 if __name__ == "__main__":
     unittest.main()

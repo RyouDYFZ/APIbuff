@@ -123,14 +123,18 @@ class GitPrivacyForwardingTests(unittest.TestCase):
             real_dir = directory / "real git's bin"
             real_dir.mkdir()
             real = real_dir / "git"
-            real.write_text(
-                f"#!{sys.executable}\n"
+            real_py = real_dir / "git_impl.py"
+            real_py.write_text(
                 "import json, os, sys\n"
                 "print(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read(), "
                 "'cwd': os.getcwd(), 'marker': os.environ['PRIVACY_TEST_MARKER'], "
                 "'path': os.environ['PATH']}))\n"
                 "sys.stderr.write('forwarded stderr\\n')\n"
                 "sys.exit(37)\n"
+            )
+            real.write_text(
+                "#!/bin/sh\n"
+                f'exec {shlex.quote(sys.executable)} {shlex.quote(str(real_py))} "$@"\n'
             )
             real.chmod(0o700)
             env = dict(os.environ, PATH=os.pathsep.join(map(str, [alias_dir, other_shim_dir, shim_dir, alias_dir, real_dir])),
@@ -174,7 +178,8 @@ class GitPrivacyWorkerTests(unittest.IsolatedAsyncioTestCase):
             home = directory / "worker's account"
             result_file = directory / "result.json"
             fake_cli = directory / "fake CLI's executable"
-            fake_cli.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""\
+            fake_py = directory / "fake_cli_impl.py"
+            fake_py.write_text(textwrap.dedent(f"""\
                 import json, os, pathlib, shutil, subprocess, sys, time
                 cwd = sys.argv[sys.argv.index('--cwd') + 1]
                 results = {{'git': shutil.which('git')}}
@@ -185,6 +190,10 @@ class GitPrivacyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 print('Enter a coding task', flush=True)
                 time.sleep(30)
                 """))
+            fake_cli.write_text(
+                "#!/bin/sh\n"
+                f'exec {shlex.quote(sys.executable)} {shlex.quote(str(fake_py))} "$@"\n'
+            )
             fake_cli.chmod(0o700)
             login_shell = directory / "login shell's reset"
             login_shell.write_text(

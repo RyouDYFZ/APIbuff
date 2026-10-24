@@ -234,7 +234,9 @@ class TestProxyEndpointAccountAdmission(EndpointEnvironmentTestCase):
         self.addCleanup(fetch.stop)
 
     def fetch_node(self, _url):
-        self.proxy.set_nodes([self.node])
+        # One physical exit node per account; supply as many nodes as accounts.
+        second = ProxyNode("second-node", "socks", "upstream2.invalid", 1080, {"type": "socks"})
+        self.proxy.set_nodes([self.node, second])
         return self.proxy.nodes
 
     def write_accounts(self, *, explicit=False):

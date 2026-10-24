@@ -303,8 +303,14 @@ class KeystrokeJitterSimulator:
 
         pre_enter_ms = 0.0
         if append_return:
-            # Human visual review pause after paste (300-600ms)
-            pre_enter_ms = random.uniform(self.config.pre_enter_min_ms, self.config.pre_enter_max_ms)
+            # Humans review pasted text before sending. The pause therefore
+            # scales with the amount of content: a fixed 250–500ms band for
+            # every paste regardless of length is its own statistical tell.
+            # An explicitly zero pause range disables the review pause.
+            if self.config.pre_enter_min_ms or self.config.pre_enter_max_ms:
+                review_ms = random.uniform(self.config.pre_enter_min_ms, self.config.pre_enter_max_ms)
+                review_ms += min(len(text) / 2000.0, 1.5) * random.uniform(400.0, 1500.0)
+                pre_enter_ms = min(review_ms, 5000.0)
             await asyncio.sleep(pre_enter_ms / 1000.0)
             await write_all(fd, b"\r")
 

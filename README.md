@@ -59,43 +59,45 @@ The extracted Freebuff client reports environment and input-profile information.
 
 ### 1. Requirements
 - macOS or Linux
-- Python 3.10+
-- Verified Private Freebuff CLI Build (`scripts/build_private_cli.py`) or official CLI (`freebuff login`)
-- Node.js / Bun runtime (for building the private CLI)
+- Python 3.11+ (the runtime check refuses to start on older interpreters)
+- Verified Private Freebuff CLI Build (`scripts/build_private_cli.py`) — **required**: workers fail closed on the official CLI, whose compiled PostHog telemetry ignores every opt-out switch
+- Bun on `PATH` (`npm install -g bun@1.3`, for building the private CLI)
 
 ### 2. Install Dependencies
 ```bash
 git clone https://github.com/RyouDYFZ/APIbuff.git
 cd APIbuff
 pip install -r requirements.txt
+# or pin the exact verified set:
+pip install -r requirements.lock
 ```
 
-### 3. Build Private Verified CLI (Recommended)
-Compile the audited private CLI binary with PostHog telemetry opt-out:
+### 3. Build Private Verified CLI (Required)
+Download the pinned official 0.2.34 release archive, verify its SHA-256, extract it, and rebuild it with the PostHog opt-out embedded:
 ```bash
-python3 scripts/build_private_cli.py
+python3 scripts/build_private_cli.py --fetch
 ```
-This generates `.freebuff/private-cli/freebuff` with its `freebuff.privacy.json` verification receipt.
+This generates `.freebuff/private-cli/freebuff` with its `freebuff.privacy.json` verification receipt. Verification requires the opt-out patch **inside the binary**, so a receipt generated for an official binary is rejected. Docker images build this stage automatically (Linux x64/arm64); see [cli/README.md](cli/README.md).
 
 ### 4. Authenticate (When Token Expired)
 ```bash
 ./login.sh
 ```
-Follow the browser prompt to complete OAuth login. Token will be securely stored in macOS Keychain or configured in `.env`.
+Follow the browser prompt to complete OAuth login. The helper prefers your verified private CLI; the token is stored in the CLI profile or configured in `.env`.
 
 ### 5. Launch Service
 ```bash
 ./start.sh
 ```
-The server will start on `http://0.0.0.0:8000`.
+Native mode binds `127.0.0.1` by default. The gateway **refuses to start on a non-loopback bind without `FREEBUFF_API_KEY`**:
 
-To run with custom host, port, or API key:
 ```bash
-export FREEBUFF_API_HOST="127.0.0.1"
+export FREEBUFF_API_HOST="0.0.0.0"
 export FREEBUFF_API_PORT="8000"
-export FREEBUFF_API_KEY="sk-my-secret-key"
+export FREEBUFF_API_KEY="$(python3 -c 'import secrets; print("sk-" + secrets.token_hex(32))')"
 ./start.sh
 ```
+Clients send that key as `Authorization: Bearer <FREEBUFF_API_KEY>`.
 
 ---
 
@@ -105,16 +107,12 @@ export FREEBUFF_API_KEY="sk-my-secret-key"
 ```bash
 curl http://127.0.0.1:8000/health
 ```
-Returns service status, worker pool health, active count, and uptime without leaking tokens or performing external network calls:
+Returns local liveness only — no credentials, identity, or upstream probes. **503 while no worker is running**, so containers and start scripts cannot mistake a worker-less gateway for a serving one:
 ```json
 {
   "status": "ok",
-  "version": "1.0.0",
-  "pool": {
-    "total_accounts": 1,
-    "healthy_accounts": 1,
-    "busy_workers": 0
-  }
+  "worker_count": 1,
+  "uptime_seconds": 42
 }
 ```
 
@@ -340,7 +338,7 @@ Send complete system/developer instructions and conversation history on every re
 
 - **Ultra-Long Prompts (>2000 UTF-16 units)**: The official CLI switches pastes longer than 2000 characters into file-like text attachments. APIbuff transparently detects pastes over 2000 characters and structures them as native `textAttachments`. This removes the 2000-character barrier, enabling prompts ranging from 32k to 128k+ characters without truncation.
 - **Sidecar Optimized Transcript Polling**: Polling checks the `chat-meta.json` signature first, parsing `chat-messages.json` only when the sidecar signature changes, backed by a 1-second safety fallback. This eliminates redundant JSON parsing on unchanged frames during long generations.
-- **Input Pacing**: The adapter sends `/new` separately, verifies the reset through directory creation or `/new` input history, and pastes the serialized request prefixed with `[Current Request]` so command-like syntax and paths remain ordinary prompt text.
+- **Input Pacing**: The adapter sends `/new` separately, verifies the reset through directory creation or `/new` input history, and pastes the serialized request with a single `[Current Request]` marker so command-like syntax and paths remain ordinary prompt text. Paste review pauses scale with the pasted length, and each account draws a deterministic terminal geometry from common real-world sizes.
 - **Strict Validation**: Text messages and `stream` are fully supported. Unsupported features (tool calls, multimodal inputs, assistant prefill, unsupported sampling flags) return HTTP 422. Token usage is `null` because the gateway has no verified token counts.
 
 ---
@@ -351,12 +349,12 @@ The Freebuff CLI integrates aggressive client-side telemetry, hardware probes, a
 
 ### 1. PostHog Telemetry Opt-Out & Private CLI Build Verification
 - **Upstream Issue**: Official CLI builds hardcode PostHog project keys and API endpoints directly into bundle literals. Setting environment variables like `NEXT_PUBLIC_POSTHOG_API_KEY=""` has zero effect in the compiled executable. Setting `CODEBUFF_SHIP_LOGS=false` only disables `/api/logs` and leaves PostHog and Axiom tracking active.
-- **Private Build Fix**: `scripts/build_private_cli.py` recompiles the bundle using Bun with `--env=disable`, validating SHA-256 integrity of the original bundle and all 22 embedded assets.
+- **Private Build Fix**: `scripts/build_private_cli.py` rebuilds the pinned official 0.2.34 release (archive SHA-256, per-target JavaScript digest, and every embedded asset digest pinned via `cli/freebuff-0.2.34-binary-checksums.json` and `cli/assets-0.2.34-*.json`) using Bun with `--env=disable`. Docker images perform this build automatically for Linux x64/arm64.
 - **Runtime Interception**: `cli/posthog-opt-out.js` injects an immutable no-op PostHog client at process initialization when `CODEBUFF_DISABLE_POSTHOG=1` or `CODEBUFF_SHIP_LOGS=false` is present. It neutralizes all `capture`, `identify`, `alias`, `captureException`, and `flush` hooks before SDK initialization.
-- **Startup Enforcement**: Workers verify the build receipt (`freebuff.privacy.json`) via `app/cli_build.py` before touching account credentials. Workers refuse to fall back to an unverified official binary or npm launcher. See [PostHog Opt-Out Audit](reports/posthog-opt-out-audit-2026-10-25.md) and [cli/README.md](cli/README.md).
+- **Startup Enforcement**: Workers and the container entrypoint verify via `app/cli_build.py` — before touching account credentials — that the binary **embeds the patched PostHog factory** and carries a matching receipt. A receipt generated for an official binary is rejected; there is no fallback to the npm launcher or official executable. See [PostHog Opt-Out Audit](reports/posthog-opt-out-audit-2026-10-25.md) and [cli/README.md](cli/README.md).
 
 ### 2. Cross-Platform Hardware Fingerprint Privacy Virtualization (macOS & Linux)
-- **Synthetic Identifiers**: Stable, deterministic synthetic UUID v5, 12-character hex serial numbers, and 32-character machine-id are generated uniquely for each account ID (`app/hardware_shims.py`). The system hostname is normalized to `developer-workstation.local`.
+- **Realistic Synthetic Identifiers**: Every value is deterministic per account ID (`app/hardware_shims.py`) and shaped like genuine hardware: a random-form (v4) UUID — Apple's `IOPlatformUUID` values are random v4 form, never namespace-derived v5 — a 12-character serial from Apple's serial alphabet (which omits `I` and `O`), a genuine model identifier (`Mac15,6`, `MacBookPro18,3`, …), and a per-account `<owner>s-<machine>.local` hostname in the macOS default style. Identical synthetic shapes across all accounts would themselves be a fingerprint.
 - **macOS Branch**: `app/hardware_preload.cjs` intercepts `os.hostname()` and child process execution paths. A macOS sandbox (`sandbox-exec`) denies raw execution of system `ioreg`, `system_profiler`, and `hostname` binaries, preventing child shells from bypassing shims.
 - **Linux Branch**: Virtualizes Linux machine characteristics (`/etc/machine-id`, `/var/lib/dbus/machine-id`, `/sys/class/dmi/id/product_uuid`, `product_serial`, `dmidecode`) via `fake_bin` shims, Node `fs` interception, and optional C-level `LD_PRELOAD` hooks (`libhardware_privacy.so`), skipping macOS-only sandbox requirements.
 - **Pre-flight Health Check**: Before launching a worker, the CLI executable runs a synchronous preflight check in an isolated temporary profile with networking denied.
@@ -430,7 +428,9 @@ Copy `accounts.example.json` to `accounts.json`:
 - **Least-Busy (Default)**: Dispatches requests to the worker with the lowest in-flight active turns (0 concurrency first).
 - **Round-Robin**: Sequentially rotates requests across healthy accounts.
 - **Quota-Aware**: Orders by recorded account balance when available.
-- **Single Attempt per Request**: Upstream rejections fail cleanly without cross-account retries or concatenation. Accounts receiving 429 rate limits enter a temporary cooldown defined by the upstream `Retry-After` header (or 30s fallback).
+- **Single Attempt per Request**: Upstream rejections fail cleanly without cross-account retries or concatenation.
+- **Failure Semantics**: Only credential, balance, and access verdicts (401/402/403) mark an account terminal until an explicit reload. Timeouts, upstream 5xx, client disconnects, and 429s place the account in a short cooldown (the upstream `Retry-After`, or 30s otherwise) — one dropped connection can no longer take a single-account pool down.
+- **Exclusive Exit Nodes**: One physical subscription node is assigned to at most one account. A shared exit IP is both a cross-account correlation signal and the direct trigger for the upstream per-network session cap; an account whose filter only matches already-assigned nodes reports `proxy_error` instead.
 
 ### 4. Account & Proxy Management APIs
 ```bash
@@ -504,14 +504,14 @@ All settings can be configured via environment variables or an `.env` file:
 | Variable | Default | Description |
 |---|---|---|
 | `CODEBUFF_API_KEY` | `""` | Upstream Freebuff / Codebuff OAuth token |
-| `FREEBUFF_API_KEY` | `""` | Secret bearer key required to access gateway API endpoints |
-| `FREEBUFF_API_HOST` | `0.0.0.0` | Server bind host address |
+| `FREEBUFF_API_KEY` | `""` | Secret bearer key required by gateway API endpoints; **mandatory for non-loopback binds** (startup refuses otherwise) |
+| `FREEBUFF_API_HOST` | `127.0.0.1` (`.env` example) / `0.0.0.0` (code default) | Server bind host address |
 | `FREEBUFF_API_PORT` | `8000` | Server listen port |
 | `FREEBUFF_BIN` | `.freebuff/private-cli/freebuff` | Absolute path to the verified private CLI executable |
 | `FREEBUFF_DEFAULT_MODEL` | `glm-5.3-flash` | Default model when unspecified in requests |
 | `FREEBUFF_WORKER_WORKDIR` | `/tmp/freebuff-api-worker` | Base sandbox root for worker instances |
 | `FREEBUFF_ALLOWED_WORKSPACE_ROOTS` | `""` | Colon-separated allowed filesystem roots for client workspace binding |
-| `FREEBUFF_TURN_TIMEOUT` | `120` | Maximum seconds allowed per generation turn |
+| `FREEBUFF_TURN_TIMEOUT` | `120` | Maximum seconds allowed per generation turn (plus a boot allowance per planned cold start) |
 | `FREEBUFF_BOOT_TIMEOUT` | `20` | Maximum seconds waiting for worker ready prompt |
 | `FREEBUFF_QUEUE_TIMEOUT` | `15` | Maximum seconds waiting for an available worker lease |
 | `FREEBUFF_ADMISSION_AUTO_CONFIRM` | `true` | Auto-confirm model admission prompts and bounded retries |
@@ -521,15 +521,16 @@ All settings can be configured via environment variables or an `.env` file:
 | `FREEBUFF_PROXY_LISTEN_IP` | `127.0.0.1` | Local proxy listen IP for Sing-box inbounds |
 | `FREEBUFF_PROXY_HOST` | `proxy.internal` | Virtual hostname passed to workers for `px=remote` evaluation |
 | `FREEBUFF_JITTER_MODE` | `human` | Keystroke simulation timing profile (`human`, `fast`, `instant`) |
+| `FREEBUFF_LIVE_CATALOG` | `false` | Opt-in direct catalog/session/`/me` lookups from the gateway host (offline by default; the CLI inside each worker already fetches the live catalog through its own account proxy) |
 
 ---
 
 ## 🧪 Testing & Verification
 
-The test suite runs 100% offline with mock CLI fixtures and temporary sandbox directories. It does not submit prompts or consume upstream credits:
+The test suite runs 100% offline with mock CLI fixtures and temporary sandbox directories. It does not submit prompts or consume upstream credits. CI runs the same suite on every push (`.github/workflows/ci.yml`):
 
 ```bash
-# Run all 322 offline regression tests
+# Run all 336 offline regression tests
 python3 tests/run_offline.py
 ```
 

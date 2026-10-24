@@ -3,6 +3,7 @@ import pty
 import termios
 import fcntl
 import struct
+import hashlib
 import random
 import asyncio
 import logging
@@ -57,6 +58,17 @@ from .exceptions import (
 
 logger = logging.getLogger("freebuff.worker")
 
+# Common real-world terminal geometries. Each account draws one deterministically
+# so its descriptor stays stable over time while the fleet does not report the
+# exact same size on every session.
+TERMINAL_GEOMETRIES = ((80, 24), (100, 30), (120, 40), (132, 43), (160, 50))
+
+
+def _terminal_geometry(account_id: str) -> "tuple[int, int]":
+    digest = hashlib.sha256(("freebuff:geometry:v1:" + account_id).encode()).digest()
+    columns, rows = TERMINAL_GEOMETRIES[digest[0] % len(TERMINAL_GEOMETRIES)]
+    return columns, rows
+
 # Complete OSC queries may use BEL or ST (ESC backslash) as their terminator.
 TERMINAL_COLOR_QUERY = re.compile(rb"\x1b\](10|11);\?(?:\x07|\x1b\\)")
 TERMINAL_COLOR_REPLIES = {
@@ -80,6 +92,18 @@ def validate_turn_prompt(prompt, reset_context=True):
     except UnicodeEncodeError:
         raise FreebuffBadRequestError("Prompt contains invalid Unicode.") from None
     return prompt
+
+
+def build_wire_prompt(prompt: str) -> str:
+    """Mark serialized requests so command-like text stays ordinary prompt input.
+
+    The pool's serialized format already contains structured sections; prefixing
+    it again would duplicate the marker on multi-turn or system-instructed
+    requests, a text shape no human session produces.
+    """
+    if prompt.startswith(("[Current Request]", "[System Instructions]", "[Conversation History]")):
+        return prompt
+    return "[Current Request]\n" + prompt
 
 
 def _input_history_signature(path):
@@ -171,16 +195,16 @@ class FreebuffWorker:
                 if not os.path.exists(gitignore_path):
                     with open(gitignore_path, "w") as f:
                         f.write("node_modules/\n*.pyc\n__pycache__/\n.DS_Store\n")
-                # Inherit global git configuration if present; only provide fallback if completely unconfigured
-                has_name = subprocess.run(["git", "config", "user.name"], cwd=self.workdir, capture_output=True, text=True, check=False, timeout=5).stdout.strip()
-                if not has_name:
-                    sys_user = os.environ.get("USER") or "Developer"
-                    subprocess.run(["git", "config", "user.name", sys_user], cwd=self.workdir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
-
-                has_email = subprocess.run(["git", "config", "user.email"], cwd=self.workdir, capture_output=True, text=True, check=False, timeout=5).stdout.strip()
-                if not has_email:
-                    sys_user = os.environ.get("USER") or "dev"
-                    subprocess.run(["git", "config", "user.email", f"{sys_user}@local"], cwd=self.workdir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
+                # Commit identity is per-account and non-identifying. The host's
+                # global git configuration (real name and email) must never be
+                # inherited: the CLI's git tools can read every commit author
+                # and ship it upstream with the workspace context.
+                git_identity = [
+                    ["git", "config", "user.name", "Developer"],
+                    ["git", "config", "user.email", f"{self.account_id}@workstation.local"],
+                ]
+                for config_command in git_identity:
+                    subprocess.run(config_command, cwd=self.workdir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
                 subprocess.run(["git", "add", "."], cwd=self.workdir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
                 subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=self.workdir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
                 logger.info(f"Initialized authentic Git workspace in {self.workdir}")
@@ -225,9 +249,15 @@ class FreebuffWorker:
 
         # Pin CLI configuration to this account regardless of inherited settings.
         env = get_standard_terminal_env()
+        for key in ("FREEBUFF_HARDWARE_PRIVACY", "FREEBUFF_SUPERVISOR_PS_SHIM", "FREEBUFF_SUPERVISOR_TERMINAL_VIEW"):
+            if key in os.environ:
+                env[key] = os.environ[key]
         if self.home_dir:
             env["HOME"] = self.home_dir
             env["FREEBUFF_CONFIG_DIR"] = self.config_dir
+        columns, rows = _terminal_geometry(self.account_id)
+        env["COLUMNS"] = str(columns)
+        env["LINES"] = str(rows)
 
         # Accounts authenticate through their isolated credential files. Do not
         # let a host-wide token override the selected account's identity.
@@ -259,7 +289,7 @@ class FreebuffWorker:
         # Allocate PTY/lease descriptors only after the privacy probe succeeds.
         master, slave = pty.openpty()
         os.set_blocking(master, False)
-        winsize = struct.pack("HHHH", 40, 120, 0, 0)
+        winsize = struct.pack("HHHH", rows, columns, 0, 0)
         fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, winsize)
         attrs = termios.tcgetattr(slave)
@@ -524,6 +554,14 @@ class FreebuffWorker:
         await self.jitter_simulator.type_into_fd(self.master_fd, "/new", append_return=True)
         await asyncio.sleep(0.5)
 
+    def current_model_key(self) -> Optional[str]:
+        """Return the model key persisted for this account, if any."""
+        try:
+            with open(os.path.join(self.config_dir, "settings.json"), "r") as f:
+                return json.load(f).get("freebuffModelKey")
+        except (OSError, ValueError):
+            return None
+
     async def ensure_model(self, target_model_key: str):
         """
         Ensures that the Freebuff worker is configured with the target model key.
@@ -684,7 +722,7 @@ class FreebuffWorker:
                 positions[before] = 0
         self._raw_buffer.clear()
         # Keep CLI command and file-path detection from interpreting API text.
-        wire_prompt = "[Current Request]\n" + prompt
+        wire_prompt = build_wire_prompt(prompt)
         history_path = os.path.join(self.config_dir, "message-history.json")
         history_signature = await asyncio.to_thread(_input_history_signature, history_path) if reset_context else None
         # A long paste becomes an attachment, so /new must be submitted on

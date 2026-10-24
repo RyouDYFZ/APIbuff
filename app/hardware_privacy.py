@@ -139,7 +139,7 @@ def build_worker_command(args, env, account_id, shell, login, prelude=''):
     Mutates only the supplied child environment. Every guarded launch probes
     the real executable under the same shell and preload, with networking off.
     """
-    mode = env.get('FREEBUFF_HARDWARE_PRIVACY', 'auto').strip().lower()
+    mode = env.get('FREEBUFF_HARDWARE_PRIVACY', os.getenv('FREEBUFF_HARDWARE_PRIVACY', 'auto')).strip().lower()
     if mode not in ('auto', 'macos', 'linux', 'off'):
         raise HardwarePrivacyError('FREEBUFF_HARDWARE_PRIVACY must be auto, macos, linux, or off.')
     # Inherited runtime flags must not replace the CLI entrypoint or install a

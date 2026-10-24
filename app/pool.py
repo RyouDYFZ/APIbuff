@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .accounts import AccountState, global_account_manager
 from .catalog import catalog_service
-from .config import TURN_TIMEOUT_SECONDS, WORKER_WORKDIR
+from .config import SESSION_BOOT_TIMEOUT_SECONDS, TURN_TIMEOUT_SECONDS, WORKER_WORKDIR
 from .exceptions import (
     FreebuffAuthError,
     FreebuffException,
@@ -26,6 +26,14 @@ from .worker import FreebuffWorker, validate_turn_prompt
 from .workspace import is_safe_isolated_path, sanitize_host_paths
 
 logger = logging.getLogger("freebuff.pool")
+
+# Upstream answers that say nothing about account health (client disconnects,
+# timeouts, 5xx, request errors): cool off briefly and let the worker restart
+# on its next lease. Sticky account verdicts remain 401/402/403; anything else
+# used to require a manual reload, so one dropped connection could take a
+# single-account pool down entirely.
+TRANSIENT_COOLDOWN_SECONDS = 30.0
+TERMINAL_ACCOUNT_STATUS = {401: "auth_error", 402: "payment_error", 403: "permission_error"}
 
 
 async def _finish_before_cancel(awaitable):
@@ -371,8 +379,12 @@ class MultiAccountWorkerPool:
             else:
                 acc.cooldown_until = 0
                 acc.status = "rate_limited"
+        elif status in TERMINAL_ACCOUNT_STATUS:
+            # Sticky account-level verdicts: credentials, balance, or access.
+            acc.cooldown_until = 0
+            acc.status = TERMINAL_ACCOUNT_STATUS[status]
         else:
-            acc.status = {401: "auth_error", 402: "payment_error", 403: "permission_error"}.get(status, "error")
+            acc.mark_cooldown(TRANSIENT_COOLDOWN_SECONDS, str(error))
 
     @staticmethod
     async def _stop_failed_worker(worker):
@@ -381,6 +393,28 @@ class MultiAccountWorkerPool:
         except Exception:
             logger.error("Failed to stop a worker after an interrupted turn.")
             raise
+
+    @staticmethod
+    def _planned_boots(worker, target: str, model_key) -> int:
+        """Cold starts this lease may need: worker boot, workspace or model switch."""
+        boots = 0
+        if not worker.is_running:
+            boots += 1
+        worker_workdir = os.path.realpath(os.path.abspath(worker.workdir or ""))
+        target_workdir = os.path.realpath(os.path.abspath(target or ""))
+        if worker_workdir != target_workdir:
+            boots += 1
+        current_model = getattr(worker, "current_model_key", None)
+        if model_key and (current_model is None or current_model() != model_key):
+            boots += 1
+        return boots
+
+    @staticmethod
+    def _turn_budget(boots: int) -> float:
+        """One generation budget plus a boot allowance per planned cold start."""
+        if TURN_TIMEOUT_SECONDS <= 1.0 or boots <= 0:
+            return TURN_TIMEOUT_SECONDS
+        return TURN_TIMEOUT_SECONDS + boots * (SESSION_BOOT_TIMEOUT_SECONDS + 5.0)
 
     async def execute_chat(
         self, messages: List[ChatMessage], model: Optional[str] = None,
@@ -406,9 +440,10 @@ class MultiAccountWorkerPool:
             await self.initialize()
         acc, worker = await self._acquire_worker(session_id)
         self._invalidate_owner(acc.config.id)
+        target = normalized or self._workspace_override or await asyncio.to_thread(self._default_workspace, acc.config.id)
+        budget = self._turn_budget(self._planned_boots(worker, target, model_key))
 
         async def run_leased_turn():
-            target = normalized or self._workspace_override or await asyncio.to_thread(self._default_workspace, acc.config.id)
             if not worker.is_running:
                 await worker.start()
             await worker.ensure_workspace(target)
@@ -422,7 +457,7 @@ class MultiAccountWorkerPool:
                 # One budget covers process startup, workspace/model changes,
                 # input and generation. Cleanup may outlive it while the lease
                 # stays held; no successor may reuse a half-stopped worker.
-                result = await asyncio.wait_for(run_leased_turn(), TURN_TIMEOUT_SECONDS)
+                result = await asyncio.wait_for(run_leased_turn(), budget)
             except asyncio.TimeoutError:
                 raise FreebuffTimeoutError() from None
             if session_id:
@@ -434,7 +469,8 @@ class MultiAccountWorkerPool:
             try:
                 await _finish_before_cancel(self._stop_failed_worker(worker))
             except asyncio.CancelledError:
-                acc.status = "error"
+                # Cleanup survived the cancellation and finished; the transient
+                # verdict from _record_failure already applies.
                 raise
             except Exception:
                 # Preserve the upstream error; a worker with uncertain cleanup is

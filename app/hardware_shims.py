@@ -1,37 +1,72 @@
-"""Synthetic outputs for the macOS and Linux probes used by the extracted CLI."""
+"""Synthetic outputs for the macOS and Linux probes used by the extracted CLI.
+
+Every value is deterministic per account and shaped like a real one: a
+version-4 UUID (Apple IOPlatformUUID values are random v4 form, never the
+namespace-derived v5 form), a 12-character serial from Apple's serial alphabet
+(which omits I and O), a genuine model identifier, and a per-account
+``<owner>s-<machine>.local`` hostname in the macOS default style. Identical
+synthetic shapes across every account would themselves be a fingerprint.
+"""
 
 import hashlib
 import json
+import random
 import re
 import uuid
+
+# Apple serial numbers omit I and O to avoid confusion with 1 and 0.
+SERIAL_ALPHABET = "ABCDEFGHJKLMNPQRSTVWXYZ0123456789"
+MAC_MODELS = (
+    ("MacBook Pro", "Mac15,6"),
+    ("MacBook Pro", "MacBookPro18,3"),
+    ("MacBook Air", "Mac14,2"),
+    ("MacBook Air", "Mac14,9"),
+    ("Mac mini", "Macmini9,1"),
+    ("iMac", "iMac21,1"),
+)
+HOSTNAME_OWNERS = (
+    "alex", "sam", "jordan", "taylor", "morgan", "casey",
+    "riley", "jamie", "drew", "quinn", "avery", "blake",
+)
+HOSTNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}\.local$")
+SERIAL_PATTERN = re.compile(r"^[A-HJ-NP-Z0-9]{12}$")
 
 
 def hardware_identity(account_id):
     if not isinstance(account_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', account_id):
         raise ValueError('A valid account ID is required for hardware privacy.')
+    seed = hashlib.sha256(('freebuff:hardware:v2:' + account_id).encode()).digest()
+    generator = random.Random(seed)
+    uuid_v4 = uuid.UUID(int=generator.getrandbits(128), version=4)
+    machine_name, model = MAC_MODELS[seed[0] % len(MAC_MODELS)]
+    owner = HOSTNAME_OWNERS[seed[1] % len(HOSTNAME_OWNERS)]
+    hostname = f"{owner}s-{machine_name.lower().replace(' ', '-')}.local"
     return {
-        'uuid': str(uuid.uuid5(uuid.NAMESPACE_URL, 'freebuff:hardware:v1:' + account_id)).upper(),
-        'serial': hashlib.sha256(('freebuff:serial:v1:' + account_id).encode()).hexdigest()[:12].upper(),
-        'hostname': 'developer-workstation.local',
+        'uuid': str(uuid_v4).upper(),
+        'serial': ''.join(generator.choice(SERIAL_ALPHABET) for _ in range(12)),
+        'hostname': hostname,
         'machine_id': hashlib.sha256(('freebuff:machineid:v1:' + account_id).encode()).hexdigest()[:32].lower(),
+        'machine_name': machine_name,
+        'model': model,
     }
 
 
 def shim_sources(identity):
     """No shim executes a real probe, even for an unrecognized argument list."""
+    board_id = 'Mac-' + hashlib.sha256(identity['serial'].encode()).hexdigest()[:8].upper()
     ioreg = f'''+-o IOPlatformExpertDevice  <class IOPlatformExpertDevice>
     {{
       "IOPlatformUUID" = "{identity['uuid']}"
       "IOPlatformSerialNumber" = "{identity['serial']}"
       "manufacturer" = <"Apple Inc.">
-      "model" = <"VirtualMac1,1">
-      "board-id" = <"VirtualMac">
+      "model" = <"{identity['model']}">
+      "board-id" = <"{board_id}">
     }}
 '''
     profiler = json.dumps({'SPHardwareDataType': [{
         '_name': 'hardware_overview',
-        'machine_name': 'Virtual Workstation',
-        'machine_model': 'VirtualMac1,1',
+        'machine_name': identity['machine_name'],
+        'machine_model': identity['model'],
         'platform_UUID': identity['uuid'],
         'serial_number': identity['serial'],
         'boot_rom_version': '',
@@ -58,10 +93,10 @@ FREEBUFF_SYNTHETIC_HARDWARE
     exit 0 ;;
 esac
 ''' + failure,
-        'hostname': '''#!/bin/sh
+        'hostname': f'''#!/bin/sh
 case "$#:$*" in
-  '0:'|'1:-f') printf '%s\\n' 'developer-workstation.local'; exit 0 ;;
-  '1:-s') printf '%s\\n' 'developer-workstation'; exit 0 ;;
+  '0:'|'1:-f') printf '%s\\n' '{identity['hostname']}'; exit 0 ;;
+  '1:-s') printf '%s\\n' '{identity['hostname'].removesuffix('.local')}'; exit 0 ;;
 esac
 ''' + failure,
         'dmidecode': f'''#!/bin/sh
@@ -74,14 +109,14 @@ SMBIOS 2.8 present.
 
 Handle 0x0001, DMI type 1, 27 bytes
 System Information
-	Manufacturer: Cloud Provider
-	Product Name: Virtual Machine
+	Manufacturer: {identity['machine_name']}
+	Product Name: {identity['model']}
 	Version: 1.0
 	Serial Number: {identity['serial']}
 	UUID: {identity['uuid']}
 	Wake-up Type: Power Switch
 	SKU Number: Default string
-	Family: Virtual
+	Family: Notebook
 FREEBUFF_SYNTHETIC_DMI
     exit 0 ;;
   *'-t 4'*|*'-t 7'*)
@@ -101,13 +136,13 @@ for arg in "$@"; do
       printf "%s\\n" "{identity['serial']}"
       exit 0 ;;
     *"product_name"*)
-      printf "%s\\n" "Virtual Machine"
+      printf "%s\\n" "{identity['model']}"
       exit 0 ;;
     *"product_version"*)
       printf "%s\\n" "1.0"
       exit 0 ;;
     *"sys_vendor"*)
-      printf "%s\\n" "Cloud Provider"
+      printf "%s\\n" "{identity['machine_name']}"
       exit 0 ;;
   esac
 done

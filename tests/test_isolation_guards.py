@@ -74,6 +74,26 @@ class TestIsolationGuards(unittest.TestCase):
             if current_user:
                 self.assertNotIn(current_user, p, f"Found leaking user path in PATH: {p}")
 
+    def test_gateway_secrets_never_reach_the_worker_environment(self):
+        # Built by concatenation to keep credential-shaped literals out of the
+        # source; these are env-var names carrying dummy probe values.
+        secret_names = ("FREEBUFF" + "_API_KEY", "CODEBUFF" + "_API_KEY",
+                        "AWS_SECRET" + "_ACCESS_KEY")
+        host_hints = {"TZ": "Asia/Shanghai",
+                      "SSH_CONNECTION": "10.0.0.1 1 10.0.0.2 2",
+                      "ITERM_SESSION_ID": "w0t0p0:secret"}
+        with patch.dict(os.environ, {**{name: "leak-probe" for name in secret_names},
+                                     **host_hints}):
+            env = get_standard_terminal_env()
+        for name in secret_names:
+            self.assertNotIn(name, env, f"{name} leaked into the worker environment")
+        for key in host_hints:
+            self.assertNotIn(key, env)
+        for key in ("TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLORTERM", "SHELL",
+                    "HOME", "USER", "LOGNAME", "LANG", "COLUMNS", "LINES", "PATH",
+                    "CODEBUFF_DISABLE_POSTHOG", "CODEBUFF_SHIP_LOGS"):
+            self.assertIn(key, env)
+
     def test_inherited_or_overridden_cli_trust_cannot_bypass_gateway_opt_in(self):
         for value in ("1", "true", "yes"):
             with self.subTest(value=value), patch.dict(os.environ, {

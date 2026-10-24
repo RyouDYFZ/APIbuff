@@ -43,7 +43,13 @@ def _signal_group(pgid, sig):
 
 
 def _child_exited(pid):
-    return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    if hasattr(os, "waitid"):
+        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    try:
+        wpid, _ = os.waitpid(pid, os.WNOHANG)
+        return wpid == pid
+    except ChildProcessError:
+        return True
 
 
 def supervise(control_fd, terminal_fd, command):

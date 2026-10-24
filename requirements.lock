@@ -1,0 +1,10 @@
+# Exact dependency versions the offline test suite was verified against.
+# Install with:  pip install -r requirements.lock
+anyio==4.15.1
+cryptography==50.0.2
+fastapi==0.162.0
+pydantic==2.14.1
+PyYAML==6.0.3
+requests==2.34.2
+starlette==1.9.0
+uvicorn==0.54.0

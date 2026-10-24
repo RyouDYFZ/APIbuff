@@ -1,8 +1,10 @@
 """Offline entrypoint and explicit-account credential regression checks."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import shlex
 import subprocess
 import sys
@@ -14,6 +16,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.accounts import AccountManager
+from app.cli_build import AUDITED_BUNDLE_SHA256, PRIVATE_GUARD
+
+# A fixture binary that satisfies entrypoint verification: it embeds the
+# patched PostHog factory shape and carries a matching receipt.
+FIXTURE_BODY = b"fixture build\nif (gatewayPostHogDisabled())\n  return gatewayDisabledPostHogClient();\n"
+
+
+def write_private_cli_fixture(root: Path) -> Path:
+    binary = root / "private-cli" / "freebuff"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(FIXTURE_BODY)
+    binary.chmod(0o700)
+    receipt = {
+        "privacy_build_version": 1,
+        "platform": platform.system().lower(),
+        "machine": platform.machine(),
+        "posthog_switch": "CODEBUFF_DISABLE_POSTHOG",
+        "source_bundle_sha256": AUDITED_BUNDLE_SHA256,
+        "guard_sha256": hashlib.sha256(PRIVATE_GUARD.read_bytes()).hexdigest(),
+        "binary_sha256": hashlib.sha256(FIXTURE_BODY).hexdigest(),
+    }
+    binary.with_name(binary.name + ".privacy.json").write_text(json.dumps(receipt))
+    return binary
 
 
 class TestContainerCredentialStartup(unittest.TestCase):
@@ -45,6 +70,7 @@ class TestContainerCredentialStartup(unittest.TestCase):
             "HOME": str(self.root / "home"),
             "FREEBUFF_CONFIG_DIR": str(self.config),
             "FREEBUFF_WORKER_WORKDIR": str(self.workspace),
+            "FREEBUFF_BIN": str(write_private_cli_fixture(self.root)),
             "PATH": str(bin_dir) + ":/usr/bin:/bin",
         }
         for key in ("CODEBUFF_API_KEY", "FREEBUFF_AUTH_TOKEN", "FREEBUFF_USER_EMAIL"):

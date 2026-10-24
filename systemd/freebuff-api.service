@@ -4,15 +4,27 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+# Dedicated unprivileged account; scripts/setup_linux.sh creates it.
+User=freebuff
+Group=freebuff
 WorkingDirectory=/opt/freebuff-api-service
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="FREEBUFF_BIN=/opt/freebuff/private-cli/freebuff"
 EnvironmentFile=-/opt/freebuff-api-service/.env
-ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Loopback by default. To expose the service, change the host here and set a
+# strong FREEBUFF_API_KEY in the EnvironmentFile; the gateway itself refuses
+# an authenticated-less non-loopback bind.
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target

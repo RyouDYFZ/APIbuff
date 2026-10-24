@@ -29,10 +29,17 @@ class HardwareProfileTests(unittest.TestCase):
         self.assertNotEqual(first['uuid'], second['uuid'])
         self.assertNotEqual(first['serial'], second['serial'])
         self.assertNotEqual(first['machine_id'], second['machine_id'])
-        self.assertEqual(uuid.UUID(first['uuid']).version, 5)
-        self.assertRegex(first['serial'], r'^[A-F0-9]{12}$')
+        # A random (v4) UUID shape, an Apple-alphabet serial without I/O, a
+        # real model identifier, and a per-account .local hostname: values
+        # shaped like genuine hardware rather than one shared synthetic form.
+        self.assertEqual(uuid.UUID(first['uuid']).version, 4)
+        self.assertRegex(first['serial'], r'^[A-HJ-NP-Z0-9]{12}$')
+        self.assertNotIn('I', first['serial'])
+        self.assertNotIn('O', first['serial'])
         self.assertRegex(first['machine_id'], r'^[a-f0-9]{32}$')
-        self.assertEqual(first['hostname'], 'developer-workstation.local')
+        self.assertRegex(first['hostname'], r'^[a-z0-9][a-z0-9-]*\.local$')
+        self.assertNotEqual(first['hostname'], second['hostname'])
+        self.assertIn(first['model'], ('Mac15,6', 'MacBookPro18,3', 'Mac14,2', 'Mac14,9', 'Macmini9,1', 'iMac21,1'))
         for value in ('', '../account', 'a/b', 'a b', None):
             with self.assertRaises(ValueError):
                 hardware_identity(value)
@@ -156,7 +163,7 @@ class LinuxHardwareRuntimeTests(unittest.TestCase):
                 # Ensure assignments applied
                 self.assertIn('BUN_OPTIONS', env)
                 self.assertIn('--preload=', env['BUN_OPTIONS'])
-                self.assertEqual(env['HOSTNAME'], 'developer-workstation.local')
+                self.assertEqual(env['HOSTNAME'], hardware_identity('account-linux-1')['hostname'])
                 self.assertIn('fake_bin', env['PATH'])
 
     def test_linux_preload_virtualization_in_node(self):
@@ -216,14 +223,15 @@ class MacHardwareRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="privacy fixture's ") as temporary:
             directory = Path(temporary)
             source = directory / 'fixture.ts'
-            source.write_text('''
+            fixture_source = '''
 import { hostname } from 'node:os';
 import { exec, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { writeFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
+const expectedHostname = __EXPECTED_HOSTNAME__;
 const payload = JSON.parse(execFileSync('/usr/sbin/system_profiler', ['SPHardwareDataType', '-json'], {encoding:'utf8'})).SPHardwareDataType[0];
-assert.equal(hostname(), 'developer-workstation.local');
+assert.equal(hostname(), expectedHostname);
 const result = await promisify(exec)('/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice');
 assert.equal(typeof result.stderr, 'string');
 assert(result.stdout.includes(payload.platform_UUID));
@@ -237,7 +245,10 @@ const cwd = process.argv.indexOf('--cwd');
 writeFileSync(process.argv[cwd + 1] + '/fixture-result.json', JSON.stringify(payload));
 console.log('Enter a coding task');
 setInterval(() => {}, 1000);
-''')
+'''
+            source.write_text(fixture_source.replace(
+                '__EXPECTED_HOSTNAME__',
+                json.dumps(hardware_identity('offline-worker')['hostname'])))
             binary = directory / 'compiled fixture'
             result = subprocess.run([bun, 'build', '--compile', str(source), '--outfile', str(binary)], cwd=directory, capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr)

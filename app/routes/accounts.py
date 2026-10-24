@@ -2,6 +2,8 @@
 FastAPI Routes for Multi-Account Monitoring, VPN Proxy Management, and Load Balancing.
 """
 
+import time
+
 from fastapi import APIRouter, HTTPException
 from typing import Dict, Any
 
@@ -11,6 +13,18 @@ from ..pool import global_pool
 from ..exceptions import FreebuffException
 
 router = APIRouter()
+
+# Maintenance endpoints drain every active lease and restart the proxy core;
+# a tight loop of them is a self-inflicted denial of service, so space them out.
+ADMIN_ACTION_INTERVAL_SECONDS = 2.0
+_last_admin_action = {"at": 0.0}
+
+
+def _throttle_admin_action() -> None:
+    now = time.monotonic()
+    if now - _last_admin_action["at"] < ADMIN_ACTION_INTERVAL_SECONDS:
+        raise HTTPException(status_code=429, detail="Admin maintenance actions are rate limited; retry in a couple of seconds.")
+    _last_admin_action["at"] = now
 
 @router.get("/v1/accounts")
 async def get_accounts_status() -> Dict[str, Any]:
@@ -34,6 +48,7 @@ async def get_accounts_status() -> Dict[str, Any]:
 @router.post("/v1/accounts/reload")
 async def reload_accounts() -> Dict[str, Any]:
     """Hot-reloads accounts.json and updates proxy bindings without gateway downtime."""
+    _throttle_admin_action()
     try:
         await global_pool.reload()
         return {
@@ -62,6 +77,7 @@ async def refresh_proxies() -> Dict[str, Any]:
     if not global_account_manager.subscription_url:
         raise HTTPException(status_code=400, detail="No subscription_url configured in accounts.json")
 
+    _throttle_admin_action()
     try:
         await global_pool.reload()
     except FreebuffException:

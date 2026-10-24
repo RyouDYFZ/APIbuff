@@ -31,7 +31,9 @@ async def _cancel_and_wait(*tasks):
     """Return only after the execution (including worker cleanup) has stopped."""
     tasks = [task for task in tasks if task is not None]
     for task in tasks:
-        if not task.done() and not task.cancelling():
+        cancelling = getattr(task, "cancelling", None)
+        is_cancelling = cancelling() if cancelling is not None else task.cancelled()
+        if not task.done() and not is_cancelling:
             task.cancel()
     # AnyIO scopes and repeated Task.cancel() calls must not cancel the cleanup
     # itself. Multiple owners may wait for the same execution during a disconnect.

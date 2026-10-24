@@ -26,7 +26,7 @@ services:
       # No accounts file is mounted here: this instance uses its one env token.
       FREEBUFF_ACCOUNTS_FILE: /run/freebuff/single-account.json
       FREEBUFF_SANDBOX_DIR: /var/lib/freebuff/accounts
-      FREEBUFF_BIN: ${FREEBUFF_BIN:-/root/.config/manicode/freebuff}
+      FREEBUFF_BIN: ${FREEBUFF_BIN:-/opt/freebuff/private-cli/freebuff}
       FREEBUFF_HARDWARE_PRIVACY: ${FREEBUFF_HARDWARE_PRIVACY:-auto}
       FREEBUFF_WORKER_WORKDIR: /workspace
       FREEBUFF_API_HOST: 0.0.0.0

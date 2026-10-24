@@ -170,9 +170,13 @@ class AccountManager:
             # Removing a subscription must not keep its previous nodes available.
             global_proxy_manager.set_nodes([])
 
-        # 2. Pair accounts with proxies and prepare sandboxes
+        # 2. Pair accounts with proxies and prepare sandboxes. One physical
+        # node serves at most one account: a shared exit IP is both a
+        # cross-account correlation signal and the upstream per-network
+        # session-cap trigger.
         singbox_bindings = []
         bound_accounts = []
+        assigned_node_names = set()
         next_port = BASE_INBOUND_PORT + 1
         new_accounts = {}
 
@@ -184,17 +188,25 @@ class AccountManager:
                     state.assigned_proxy = acc.proxy
                     state.assigned_node_name = "Explicit Proxy"
                 elif subscription_url or acc.node_filter is not None:
-                    # Match node from subscription
-                    matched_node = global_proxy_manager.find_node(acc.node_filter) if subscription_ready else None
+                    # Match node from subscription, never reusing one already
+                    # assigned to another account in this configuration.
+                    matched_node = (
+                        global_proxy_manager.find_node(acc.node_filter, exclude_names=assigned_node_names)
+                        if subscription_ready else None
+                    )
                     if matched_node:
                         port = next_port
                         next_port += 1
                         singbox_bindings.append({"port": port, "node": matched_node})
                         state.assigned_node_name = matched_node.name
+                        assigned_node_names.add(matched_node.name)
                         bound_accounts.append(state)
                     else:
                         state.status = "proxy_error"
-                        state.last_error = "Required proxy is unavailable: subscription failed or no node matched."
+                        state.last_error = (
+                            "Required proxy is unavailable: subscription failed, no node "
+                            "matched, or every matching node is already assigned to another account."
+                        )
 
                 # Pre-seed isolated credentials in sandbox
                 self._seed_sandbox(state)

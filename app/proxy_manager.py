@@ -426,12 +426,20 @@ class ProxyManager:
     def set_nodes(self, nodes: List[ProxyNode]):
         self.nodes = nodes
 
-    def find_node(self, filter_pattern: Optional[str] = None) -> Optional[ProxyNode]:
-        """Select the first node only when no filter was requested; fail closed otherwise."""
+    def find_node(self, filter_pattern: Optional[str] = None,
+                  exclude_names: Optional[set] = None) -> Optional[ProxyNode]:
+        """Select the first node only when no filter was requested; fail closed otherwise.
+
+        ``exclude_names`` lets callers keep one physical exit node per account:
+        two accounts sharing an exit IP is both a correlation signal and the
+        direct trigger for the upstream per-network session cap.
+        """
         if not self.nodes:
             return None
+        excluded = set(exclude_names or ())
         if filter_pattern is None:
-            return self.nodes[0]
+            first_available = next((n for n in self.nodes if n.name not in excluded), None)
+            return first_available
         if not filter_pattern.strip():
             return None
         try:
@@ -440,6 +448,8 @@ class ProxyManager:
             logger.warning("Invalid proxy node filter; no node selected.")
             return None
         for node in self.nodes:
+            if node.name in excluded:
+                continue
             if pattern.search(node.name) or pattern.search(node.protocol):
                 return node
         return None

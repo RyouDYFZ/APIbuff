@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
@@ -393,6 +394,40 @@ class TestAccountMaintenanceRoutes(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FreebuffException) as caught:
                 await routes.reload_accounts()
         self.assertIs(caught.exception, error)
+
+
+class OrphanedSingboxReaperTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.pid_file = Path(temporary.name) / "singbox.pid"
+        reap = patch.object(ProxyManager, "_pid_file", return_value=self.pid_file)
+        reap.start()
+        self.addCleanup(reap.stop)
+        self.manager = ProxyManager(singbox_bin=str(self.pid_file.parent / "no-binary"))
+
+    def test_garbage_pid_file_is_cleared_without_a_lookup(self):
+        self.pid_file.write_text("not-a-pid\n")
+        with patch.object(ProxyManager, "_process_name", side_effect=AssertionError("no lookup expected")):
+            self.manager._reap_orphaned_singbox()
+        self.assertFalse(self.pid_file.exists())
+
+    def test_orphan_named_singbox_is_signalled_and_file_removed(self):
+        self.pid_file.write_text(f"{os.getpid()}\n")
+        sent = []
+        with patch.object(ProxyManager, "_process_name", return_value="sing-box"), \
+             patch("app.proxy_manager.os.kill", side_effect=lambda pid, sig: sent.append(sig)), \
+             patch("app.proxy_manager.time.sleep"):
+            self.manager._reap_orphaned_singbox()
+        self.assertIn(signal.SIGTERM, sent)
+        self.assertFalse(self.pid_file.exists())
+
+    def test_recycled_pid_of_an_unrelated_process_is_never_killed(self):
+        self.pid_file.write_text(f"{os.getpid()}\n")
+        with patch.object(ProxyManager, "_process_name", return_value="python3"), \
+             patch("app.proxy_manager.os.kill", side_effect=AssertionError("must not signal")):
+            self.manager._reap_orphaned_singbox()
+        self.assertFalse(self.pid_file.exists())
 
 
 if __name__ == "__main__":

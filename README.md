@@ -530,7 +530,7 @@ All settings can be configured via environment variables or an `.env` file:
 The test suite runs 100% offline with mock CLI fixtures and temporary sandbox directories. It does not submit prompts or consume upstream credits. CI runs the same suite on every push (`.github/workflows/ci.yml`):
 
 ```bash
-# Run all 336 offline regression tests
+# Run all 339 offline regression tests
 python3 tests/run_offline.py
 ```
 

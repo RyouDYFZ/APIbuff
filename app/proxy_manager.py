@@ -13,9 +13,12 @@ import ipaddress
 import re
 import shutil
 import logging
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+from pathlib import Path
 import urllib.request
 import urllib.parse
 from typing import List, Dict, Any, Optional
@@ -511,10 +514,71 @@ class ProxyManager:
         """Use the same validated endpoint snapshot as the generated config."""
         return self.local_endpoint.url_for_port(port)
 
+    def _pid_file(self) -> Path:
+        return Path(tempfile.gettempdir()) / f"freebuff-singbox-{os.getuid()}.pid"
+
+    @staticmethod
+    def _process_name(pid: int) -> str:
+        """Best-effort process name lookup; empty when the process is gone."""
+        try:
+            with open(f"/proc/{pid}/comm", encoding="utf-8") as stream:
+                return stream.read().strip()
+        except OSError:
+            pass
+        if sys.platform == "darwin":
+            try:
+                return subprocess.check_output(
+                    ["/bin/ps", "-o", "comm=", "-p", str(pid)],
+                    timeout=2, stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        return ""
+
+    def _reap_orphaned_singbox(self) -> None:
+        """Terminate a daemon left behind by a SIGKILLed gateway.
+
+        Without this, the orphan holds every inbound port and every later
+        start fails into proxy_error until someone hunts it down by hand.
+        Only a process whose name still contains sing-box is signalled, so a
+        recycled PID can never be killed by accident.
+        """
+        pid_file = self._pid_file()
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
+            return
+        if pid > 1 and "sing-box" in self._process_name(pid).lower():
+            logger.warning("Reaping orphaned sing-box daemon (pid=%s) from a previous gateway.", pid)
+            for send in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(pid, send)
+                except OSError:
+                    break
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    continue
+                break
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+
     def start_singbox(self, config: Dict[str, Any]) -> bool:
         """Start a validated daemon and report failure before any worker is launched."""
         pending_inbounds = dict(self._pending_inbounds)
         self.stop_singbox()
+        self._reap_orphaned_singbox()
         if not self.singbox_bin or not os.path.isfile(self.singbox_bin) or not os.access(self.singbox_bin, os.X_OK):
             logger.warning("Executable sing-box binary not found; required proxies are unavailable.")
             return False
@@ -543,6 +607,10 @@ class ProxyManager:
                 self.process.wait(timeout=SINGBOX_STARTUP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
                 if self.is_running:
+                    try:
+                        self._pid_file().write_text(f"{self.process.pid}\n", encoding="utf-8")
+                    except OSError:
+                        pass
                     self.active_inbounds = pending_inbounds
                     logger.info("Sing-box daemon started with %s inbounds.", len(self.active_inbounds))
                     return True
@@ -571,6 +639,10 @@ class ProxyManager:
                 if stream is not None:
                     stream.close()
             logger.info("Sing-box daemon stopped.")
+        try:
+            self._pid_file().unlink()
+        except OSError:
+            pass
         self.active_inbounds.clear()
         if self.config_path is not None:
             try:

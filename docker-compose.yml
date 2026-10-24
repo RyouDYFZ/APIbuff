@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  freebuff-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: freebuff-api-gateway
+    restart: unless-stopped
+    ports:
+      - "${FREEBUFF_API_PORT:-8000}:8000"
+    environment:
+      # Upstream Codebuff OAuth Token (Obtained from ~/.config/manicode/credentials.json or ./login.sh)
+      - CODEBUFF_API_KEY=${CODEBUFF_API_KEY:-}
+      - FREEBUFF_USER_EMAIL=${FREEBUFF_USER_EMAIL:-cloud@freebuff.local}
+      
+      # Gateway Access Protection (Clients pass Authorization: Bearer <FREEBUFF_API_KEY>)
+      - FREEBUFF_API_KEY=${FREEBUFF_API_KEY:-}
+      
+      # Default Model & Execution Tuning
+      - FREEBUFF_DEFAULT_MODEL=${FREEBUFF_DEFAULT_MODEL:-glm-5.3-flash}
+      - FREEBUFF_JITTER_MODE=${FREEBUFF_JITTER_MODE:-human}
+      - FREEBUFF_TURN_TIMEOUT=${FREEBUFF_TURN_TIMEOUT:-120}
+      - PORT=8000
+    volumes:
+      # Persist credentials, device keys, settings, and logs
+      - freebuff_config:/root/.config/manicode
+      # Persist code repository and workspace
+      - freebuff_workspace:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  freebuff_config:
+    driver: local
+  freebuff_workspace:
+    driver: local

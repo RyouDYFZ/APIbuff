@@ -1,0 +1,18 @@
+[Unit]
+Description=Freebuff OpenAI-Compatible API Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/freebuff-api-service
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=-/opt/freebuff-api-service/.env
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

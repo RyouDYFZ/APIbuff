@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.freebuff.api</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-l</string>
+        <string>-c</string>
+        <string>cd "$HOME/Documents/Freebuff Research" &amp;&amp; ./start.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TERM</key>
+        <string>xterm-256color</string>
+        <key>COLORTERM</key>
+        <string>truecolor</string>
+        <key>TERM_PROGRAM</key>
+        <string>Apple_Terminal</string>
+        <key>TERM_PROGRAM_VERSION</key>
+        <string>2.15</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>FREEBUFF_SPAWN_MODE</key>
+        <string>detached_zsh</string>
+        <key>FREEBUFF_JITTER_MODE</key>
+        <string>human</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/freebuff-api.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/freebuff-api.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

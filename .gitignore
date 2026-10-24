@@ -1,0 +1,30 @@
+# Reverse engineering & research scratch dumps (local disk only)
+extracted_freebuff/
+extracted_freebuff_full/
+extracted_sources/
+package/
+unbuned/
+*.tgz
+*.dylib
+*.wasm
+.freebuff/
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+
+# Logs & Temporary files
+*.log
+*.pid
+.DS_Store
+
+# Freebuff runtime dynamic files
+token.json
+credentials.json
+chat-messages.json
+log.jsonl

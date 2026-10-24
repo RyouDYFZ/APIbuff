@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: freebuff-api-gateway
+    env: docker
+    plan: free
+    region: oregon
+    dockerfilePath: Dockerfile
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: CODEBUFF_API_KEY
+        sync: false
+      - key: FREEBUFF_API_KEY
+        generateValue: true
+      - key: FREEBUFF_DEFAULT_MODEL
+        value: glm-5.3-flash
+      - key: FREEBUFF_JITTER_MODE
+        value: human
+      - key: FREEBUFF_WORKER_WORKDIR
+        value: /workspace

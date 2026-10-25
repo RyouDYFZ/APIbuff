@@ -1,5 +1,7 @@
 # Freebuff OpenAI-Compatible API Gateway
 
+**English** | [简体中文](README.zh-CN.md)
+
 An OpenAI-compatible text API proxy for **Freebuff CLI** (`npm install -g freebuff`), architected with reference to conversion engines like [sub2api](https://github.com/Wei-Shaw/sub2api).
 
 ---
@@ -59,8 +61,14 @@ The extracted Freebuff client reports environment and input-profile information.
 
 ### 1. Requirements
 - macOS or Linux
+
 - Python 3.11+ (the runtime check refuses to start on older interpreters)
-- Verified Private Freebuff CLI Build (`scripts/build_private_cli.py`) — **required**: workers fail closed on the official CLI, whose compiled PostHog telemetry ignores every opt-out switch
+
+- Verified Private Freebuff CLI Build (`scripts/build_private_cli.py`)
+
+  > [!NOTE]
+  > Workers fail closed on the official CLI, whose compiled PostHog telemetry ignores every opt-out switch.
+
 - Bun on `PATH` (`npm install -g bun@1.3`, for building the private CLI)
 
 ### 2. Install Dependencies

@@ -476,6 +476,21 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
             accepted = await ASGIExchange({"messages": [{"role": "user", "content": "Hi"}]}, headers={"Authorization": "Bearer offline-key"}).run()
             self.assertEqual(accepted.status, 200)
 
+    async def test_request_body_limit_exceeded_by_content_length_returns_413(self):
+        headers = {"content-length": str(main.MAX_REQUEST_BODY_BYTES + 1)}
+        exchange = await ASGIExchange(method="POST", headers=headers).run()
+        self.assertEqual(exchange.status, 413)
+        self.assertEqual(exchange.json["error"]["code"], "request_too_large")
+
+    async def test_request_body_limit_exceeded_by_chunked_stream_returns_413(self):
+        exchange = ASGIExchange(method="POST")
+        exchange.incoming.get_nowait()
+        huge_chunk = b"x" * (main.MAX_REQUEST_BODY_BYTES + 10)
+        exchange.incoming.put_nowait({"type": "http.request", "body": huge_chunk, "more_body": False})
+        await exchange.run()
+        self.assertEqual(exchange.status, 413)
+        self.assertEqual(exchange.json["error"]["code"], "request_too_large")
+
     def test_unknown_pricing_values_remain_null(self):
         result = PricingResponse(models_count=0, models=[], status="unknown", source="fallback")
         self.assertIsNone(result.account)

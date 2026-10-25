@@ -45,6 +45,9 @@ echo "[2/7] Setting up application in $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." >/dev/null 2>&1 && pwd )"
 cp -r "$SCRIPT_DIR/"* "$INSTALL_DIR/"
+if [ -f "$SCRIPT_DIR/.env.example" ]; then
+    cp "$SCRIPT_DIR/.env.example" "$INSTALL_DIR/.env.example"
+fi
 
 # 3. Install Python Dependencies
 echo "[3/7] Installing Python dependencies..."
@@ -59,8 +62,11 @@ python3 "$INSTALL_DIR/scripts/build_private_cli.py" \
 # 5. Configure Credentials
 echo "[5/7] Checking credentials..."
 if [ ! -f "$INSTALL_DIR/.env" ]; then
-    cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
-    echo "Created $INSTALL_DIR/.env template."
+    if [ -f "$INSTALL_DIR/.env.example" ]; then
+        cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
+        chmod 0600 "$INSTALL_DIR/.env"
+        echo "Created $INSTALL_DIR/.env template (chmod 0600)."
+    fi
 fi
 
 # 6. Dedicated unprivileged service account

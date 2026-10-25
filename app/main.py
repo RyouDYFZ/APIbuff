@@ -163,7 +163,7 @@ class RequestBodyLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             for name, value in scope.get("headers", []):
-                if name == b"content-length":
+                if name.lower() == b"content-length":
                     try:
                         length = int(value)
                     except ValueError:
@@ -177,6 +177,29 @@ class RequestBodyLimitMiddleware:
                         }})
                         await response(scope, receive, send)
                         return
+
+            received_bytes = 0
+
+            async def limited_receive():
+                nonlocal received_bytes
+                message = await receive()
+                if message.get("type") == "http.request":
+                    chunk = message.get("body", b"")
+                    received_bytes += len(chunk)
+                    if received_bytes > MAX_REQUEST_BODY_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail={
+                                "message": "Request body exceeds the supported size limit.",
+                                "type": "invalid_request_error",
+                                "param": None,
+                                "code": "request_too_large",
+                            },
+                        )
+                return message
+
+            await self.app(scope, limited_receive, send)
+            return
         await self.app(scope, receive, send)
 
 

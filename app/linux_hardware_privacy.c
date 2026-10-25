@@ -34,29 +34,30 @@ static const char *get_replacement(const char *path) {
     if (!synth_dir) return NULL;
     static __thread char redirect_buf[1024];
 
-    if (strcmp(path, "/etc/machine-id") == 0 || strcmp(path, "/var/lib/dbus/machine-id") == 0 ||
-        strstr(path, "/etc/machine-id") != NULL || strstr(path, "/var/lib/dbus/machine-id") != NULL) {
+    if (strcmp(path, "/etc/machine-id") == 0 || strcmp(path, "/var/lib/dbus/machine-id") == 0) {
         snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/machine-id", synth_dir);
         return redirect_buf;
     }
     if (strncmp(path, "/sys/", 5) == 0) {
-        if (strstr(path, "product_uuid") != NULL) {
+        const char *slash = strrchr(path, '/');
+        const char *name = slash ? slash + 1 : path;
+        if (strcmp(name, "product_uuid") == 0) {
             snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/product_uuid", synth_dir);
             return redirect_buf;
         }
-        if (strstr(path, "product_serial") != NULL) {
+        if (strcmp(name, "product_serial") == 0) {
             snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/product_serial", synth_dir);
             return redirect_buf;
         }
-        if (strstr(path, "product_name") != NULL) {
+        if (strcmp(name, "product_name") == 0) {
             snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/product_name", synth_dir);
             return redirect_buf;
         }
-        if (strstr(path, "sys_vendor") != NULL) {
+        if (strcmp(name, "sys_vendor") == 0) {
             snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/sys_vendor", synth_dir);
             return redirect_buf;
         }
-        if (strstr(path, "product_version") != NULL) {
+        if (strcmp(name, "product_version") == 0) {
             snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/product_version", synth_dir);
             return redirect_buf;
         }

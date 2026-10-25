@@ -3,7 +3,6 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -124,11 +123,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY_IMAGE }}
+          # Version tags (x.y.z) are owned by release.yml, which runs on
+          # published GitHub Releases instead of bare tag pushes.
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha
       - name: Create and push multi-arch manifest
         working-directory: ${{ runner.temp }}/digests

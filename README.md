@@ -108,7 +108,7 @@ docker pull ghcr.io/ryoudyfz/apibuff:latest
 docker run -d --name apibuff -p 127.0.0.1:8000:8000 --env-file .env ghcr.io/ryoudyfz/apibuff:latest
 ```
 
-`.env` must set `FREEBUFF_API_KEY` (the gateway refuses non-loopback binds without it, and containers always bind non-loopback internally). See `docker-compose.yml` for the full environment and volume set. Version tags follow `v*` git tags; every build is also tagged with its short commit SHA.
+`.env` must set `FREEBUFF_API_KEY` (the gateway refuses non-loopback binds without it, and containers always bind non-loopback internally). See `docker-compose.yml` for the full environment and volume set. Publishing a GitHub Release (`v*` tag) runs the same pipeline and pushes versioned tags (`1.0.3`, `1.0`) plus `latest` — pre-releases get their version tags but never move `latest` — and appends the image reference to the release notes. Every build also carries its short commit SHA tag.
 
 ---
 

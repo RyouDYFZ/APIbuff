@@ -99,6 +99,17 @@ export FREEBUFF_API_KEY="$(python3 -c 'import secrets; print("sk-" + secrets.tok
 ```
 Clients send that key as `Authorization: Bearer <FREEBUFF_API_KEY>`.
 
+### 6. Or Run the Prebuilt Container
+
+CI publishes a multi-arch image (linux/amd64 + linux/arm64) to GitHub Container Registry on every push to `main` — the image performs the verified private CLI build (step 3) internally:
+
+```bash
+docker pull ghcr.io/ryoudyfz/apibuff:latest
+docker run -d --name apibuff -p 127.0.0.1:8000:8000 --env-file .env ghcr.io/ryoudyfz/apibuff:latest
+```
+
+`.env` must set `FREEBUFF_API_KEY` (the gateway refuses non-loopback binds without it, and containers always bind non-loopback internally). See `docker-compose.yml` for the full environment and volume set. Version tags follow `v*` git tags; every build is also tagged with its short commit SHA.
+
 ---
 
 ## 📡 API Endpoints

@@ -1,6 +1,6 @@
 {
   "version": "0.2.34",
-  "source": "SHA-256 of every official freebuff@0.2.34 release archive, mirrored from the npm package's binaryChecksums field (a trust root separate from this repository), plus the extracted JavaScript bundle digest per target. A private-build receipt naming these digests pins its provenance transitively.",
+  "source": "SHA-256 of every official freebuff@0.2.34 release archive, mirrored from the npm package's binaryChecksums field (a trust root separate from this repository), plus the SHA-256 of the extracted executable and the extracted JavaScript bundle per target. Workers only run an executable whose digest appears under binary_sha256; telemetry is blocked at the gateway proxy instead of by patching the binary.",
   "sha256": {
     "darwin-arm64": "4af7a5edbf4dd8190043e43ea4d195fdefd10c92a416b574dbb3f555b004fdf3",
     "darwin-x64": "6a01ca258821d04a63877ee32a434cb7ac31cc42e66695563846723fdb43ac3a",
@@ -15,5 +15,10 @@
     "darwin-arm64": "c19723acf4d76aee80d2da6f31ee1d5850d255e42f6e32a462612e44248cbadf",
     "linux-x64": "304be55e2b523654d567ef02c572c69429da412e7dd818cdff8a51269d8df55a",
     "linux-arm64": "ddc7bdeb3135b7c891edcb68857849c292802d25215978e67899d92c30cd3d5c"
+  },
+  "binary_sha256": {
+    "darwin-arm64": "c601feead94cf793d375286c412df2ff67ced1dcecd687b0dafb0baa079d3d7f",
+    "linux-x64": "090b0a53cdcec76d96aef319a7e995e01569321dff78d8b9474d9e2ef5f4c843",
+    "linux-arm64": "3c9be18495ec4f352b467b42aed8b30adb3bf7ad556e9b8154217d334994b8bb"
   }
 }

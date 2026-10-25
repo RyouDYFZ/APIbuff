@@ -37,9 +37,32 @@ jobs:
       - name: Run the offline regression suite
         run: python tests/run_offline.py
 
+  # The official binary now runs unmodified, so repackaging can no longer
+  # break its startup. This gate instead vets the pinned release itself in a
+  # real pty before deployment: it fails on damaged assets, renderer load
+  # errors and blank frames — the historical failure mode this repository
+  # hit when CLI builds were still being rebuilt.
+  cli-render-smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch and verify the pinned official CLI
+        run: python3 scripts/fetch_official_cli.py --target linux-x64 --fetch
+      - name: Render the first TUI frame under a pty
+        run: |
+          mkdir -p .freebuff/render-smoke
+          cp .freebuff/official-cli/freebuff .freebuff/render-smoke/freebuff
+          chmod +x .freebuff/render-smoke/freebuff
+          python3 scripts/render_smoke_check.py 25
+
   # Build one image per architecture on native runners. Stage 1 of the
-  # Dockerfile rebuilds the CLI with Bun; running that under QEMU emulation
-  # is slow and flaky, so arm64 uses the free native runner public repos
+  # Dockerfile installs the pinned official CLI; no Bun or Node toolchain is
+  # involved anymore, and arm64 uses the free native runner public repos
   # get instead of setup-qemu-action.
   docker-build:
     name: docker build (${{ matrix.platform }})

@@ -5,12 +5,19 @@ Manages per-account credentials, isolated home sandboxes, VPN node pairing, and 
 
 import os
 import json
+import random
 import time
 import logging
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field, field_validator
 
-from .proxy_manager import global_proxy_manager, BASE_INBOUND_PORT, validate_proxy_url, redact_proxy_url
+from .proxy_manager import (
+    ProxyNode,
+    global_proxy_manager,
+    BASE_INBOUND_PORT,
+    validate_proxy_url,
+    redact_proxy_url,
+)
 from .credentials import (
     account_config_dir,
     default_config_dir,
@@ -58,11 +65,14 @@ class AccountState:
     def is_cooling(self) -> bool:
         return time.time() < self.cooldown_until
 
-    def mark_cooldown(self, seconds: float = 60.0, reason: Optional[str] = None):
-        self.cooldown_until = time.time() + seconds
+    def mark_cooldown(self, seconds: float = 60.0, reason: Optional[str] = None, jitter: bool = False):
+        duration = seconds
+        if jitter and seconds > 0:
+            duration = max(1.0, random.gauss(seconds, seconds * 0.15))
+        self.cooldown_until = time.time() + duration
         self.status = "cooling"
         self.last_error = reason
-        logger.warning(f"Account '{self.config.id}' marked cooling for {seconds}s: {reason}")
+        logger.warning(f"Account '{self.config.id}' marked cooling for {duration:.1f}s (base: {seconds}s): {reason}")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -183,10 +193,20 @@ class AccountManager:
         for acc in raw_accounts:
             state = AccountState(acc)
             if acc.enabled:
+                node = None
                 if acc.proxy:
-                    # User specified explicit proxy URL
-                    state.assigned_proxy = acc.proxy
-                    state.assigned_node_name = "Explicit Proxy"
+                    # An explicit proxy is chained behind the gateway's own
+                    # inbound so the telemetry block rules still apply to its
+                    # traffic; the operator's endpoint stays the exit.
+                    try:
+                        node = ProxyNode.from_proxy_url(acc.proxy)
+                        state.assigned_node_name = "Explicit Proxy"
+                    except ValueError:
+                        state.status = "proxy_error"
+                        state.last_error = (
+                            "Required proxy is unavailable: the account's explicit "
+                            "proxy URL is not a supported HTTP(S)/SOCKS5 endpoint."
+                        )
                 elif subscription_url or acc.node_filter is not None:
                     # Match node from subscription, never reusing one already
                     # assigned to another account in this configuration.
@@ -195,25 +215,34 @@ class AccountManager:
                         if subscription_ready else None
                     )
                     if matched_node:
-                        port = next_port
-                        next_port += 1
-                        singbox_bindings.append({"port": port, "node": matched_node})
+                        node = matched_node
                         state.assigned_node_name = matched_node.name
                         assigned_node_names.add(matched_node.name)
-                        bound_accounts.append(state)
                     else:
                         state.status = "proxy_error"
                         state.last_error = (
                             "Required proxy is unavailable: subscription failed, no node "
                             "matched, or every matching node is already assigned to another account."
                         )
+                else:
+                    # No subscription and no explicit proxy: the account still
+                    # egresses through the gateway's inbound so telemetry stays
+                    # blocked; the outbound is simply the host network.
+                    node = ProxyNode.direct()
+                    state.assigned_node_name = "Direct (gateway-managed)"
+                if node is not None:
+                    port = next_port
+                    next_port += 1
+                    singbox_bindings.append({"port": port, "node": node})
+                    bound_accounts.append(state)
 
                 # Pre-seed isolated credentials in sandbox
                 self._seed_sandbox(state)
 
             new_accounts[acc.id] = state
 
-        # 3. If we have Sing-box bindings, build config and start daemon
+        # 3. Every enabled account has a binding: the daemon is the telemetry
+        # gate, so it must start before any worker receives credentials.
         if singbox_bindings:
             proxy_started = False
             proxy_error = "Required proxy is unavailable: sing-box could not start."

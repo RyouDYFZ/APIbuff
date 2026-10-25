@@ -61,6 +61,10 @@ static const char *get_replacement(const char *path) {
             snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/product_version", synth_dir);
             return redirect_buf;
         }
+        if (strcmp(name, "address") == 0 && strstr(path, "/net/") != NULL) {
+            snprintf(redirect_buf, sizeof(redirect_buf), "%s/synthetic/address", synth_dir);
+            return redirect_buf;
+        }
     }
     return NULL;
 }

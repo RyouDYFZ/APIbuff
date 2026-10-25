@@ -104,5 +104,9 @@ class FreebuffPaymentError(FreebuffException):
 
 
 class FreebuffInteractionRequiredError(FreebuffException):
-    def __init__(self, message="The CLI requires interactive input; complete it in the CLI before retrying."):
-        super().__init__(message, 409, "interaction_required", "interaction_required")
+    def __init__(
+        self,
+        message: str = "The CLI requires interactive input; complete it in the CLI before retrying.",
+        error_code: Optional[str] = "interaction_required",
+    ):
+        super().__init__(message, 409, "interaction_required", error_code)

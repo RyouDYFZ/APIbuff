@@ -64,12 +64,12 @@ The extracted Freebuff client reports environment and input-profile information.
 
 - Python 3.11+ (the runtime check refuses to start on older interpreters)
 
-- Verified Private Freebuff CLI Build (`scripts/build_private_cli.py`)
+- Pinned Official Freebuff CLI (`scripts/fetch_official_cli.py`)
 
   > [!NOTE]
-  > Workers fail closed on the official CLI, whose compiled PostHog telemetry ignores every opt-out switch.
+  > Workers only run the byte-exact official release — its compiled PostHog telemetry ignores every opt-out switch, so it is blocked at the gateway proxy instead.
 
-- Bun on `PATH` (`npm install -g bun@1.3`, for building the private CLI)
+- sing-box on `PATH` (the gateway proxy that isolates per-account egress and refuses telemetry)
 
 ### 2. Install Dependencies
 ```bash
@@ -80,18 +80,18 @@ pip install -r requirements.txt
 pip install -r requirements.lock
 ```
 
-### 3. Build Private Verified CLI (Required)
-Download the pinned official 0.2.34 release archive, verify its SHA-256, extract it, and rebuild it with the PostHog opt-out embedded:
+### 3. Install the Pinned Official CLI (Required)
+Download the pinned official 0.2.34 release archive, verify its SHA-256 and the executable's SHA-256 against `cli/freebuff-0.2.34-binary-checksums.json`, and install it unchanged:
 ```bash
-python3 scripts/build_private_cli.py --fetch
+python3 scripts/fetch_official_cli.py --fetch
 ```
-This generates `.freebuff/private-cli/freebuff` with its `freebuff.privacy.json` verification receipt. Verification requires the opt-out patch **inside the binary**, so a receipt generated for an official binary is rejected. Docker images build this stage automatically (Linux x64/arm64); see [cli/README.md](cli/README.md).
+This installs `.freebuff/official-cli/freebuff`. Workers refuse any executable whose digest is not pinned, so upgrades stay explicit. Docker images perform this step automatically (Linux x64/arm64); see [cli/README.md](cli/README.md).
 
 ### 4. Authenticate (When Token Expired)
 ```bash
 ./login.sh
 ```
-Follow the browser prompt to complete OAuth login. The helper prefers your verified private CLI; the token is stored in the CLI profile or configured in `.env`.
+Follow the browser prompt to complete OAuth login. The helper prefers the pinned official CLI; the token is stored in the CLI profile or configured in `.env`.
 
 ### 5. Launch Service
 ```bash
@@ -109,7 +109,7 @@ Clients send that key as `Authorization: Bearer <FREEBUFF_API_KEY>`.
 
 ### 6. Or Run the Prebuilt Container
 
-CI publishes a multi-arch image (linux/amd64 + linux/arm64) to GitHub Container Registry on every push to `main` — the image performs the verified private CLI build (step 3) internally:
+CI publishes a multi-arch image (linux/amd64 + linux/arm64) to GitHub Container Registry on every push to `main` — the image installs the pinned official CLI (step 3) internally:
 
 ```bash
 docker pull ghcr.io/ryoudyfz/apibuff:latest
@@ -366,11 +366,11 @@ Send complete system/developer instructions and conversation history on every re
 
 The Freebuff CLI integrates aggressive client-side telemetry, hardware probes, and parent process inspections. APIbuff provides comprehensive privacy safeguards across both macOS and Linux:
 
-### 1. PostHog Telemetry Opt-Out & Private CLI Build Verification
+### 1. Proxy-Level Telemetry Blocking & Official CLI Verification
 - **Upstream Issue**: Official CLI builds hardcode PostHog project keys and API endpoints directly into bundle literals. Setting environment variables like `NEXT_PUBLIC_POSTHOG_API_KEY=""` has zero effect in the compiled executable. Setting `CODEBUFF_SHIP_LOGS=false` only disables `/api/logs` and leaves PostHog and Axiom tracking active.
-- **Private Build Fix**: `scripts/build_private_cli.py` rebuilds the pinned official 0.2.34 release (archive SHA-256, per-target JavaScript digest, and every embedded asset digest pinned via `cli/freebuff-0.2.34-binary-checksums.json` and `cli/assets-0.2.34-*.json`) using Bun with `--env=disable`. Docker images perform this build automatically for Linux x64/arm64.
-- **Runtime Interception**: `cli/posthog-opt-out.js` injects an immutable no-op PostHog client at process initialization when `CODEBUFF_DISABLE_POSTHOG=1` or `CODEBUFF_SHIP_LOGS=false` is present. It neutralizes all `capture`, `identify`, `alias`, `captureException`, and `flush` hooks before SDK initialization.
-- **Startup Enforcement**: Workers and the container entrypoint verify via `app/cli_build.py` — before touching account credentials — that the binary **embeds the patched PostHog factory** and carries a matching receipt. A receipt generated for an official binary is rejected; there is no fallback to the npm launcher or official executable. See [PostHog Opt-Out Audit](reports/posthog-opt-out-audit-2026-10-25.md) and [cli/README.md](cli/README.md).
+- **Zero-Patch Policy**: The gateway runs the official executable byte-for-byte — no unpacking, rebuilding, repackaging or re-signing, so the vendor's native signature, assets and startup ordering stay intact and version upgrades are just a re-pinned download. `scripts/fetch_official_cli.py` installs the pinned 0.2.34 release after verifying the archive and executable SHA-256 against `cli/freebuff-0.2.34-binary-checksums.json`. Docker images perform this step automatically for Linux x64/arm64.
+- **Network Enforcement**: Every account egresses through the gateway's own sing-box inbound (`app/proxy_manager.py`): subscription accounts through their matched node, explicit proxies are chained behind the inbound, and proxy-less accounts get a direct outbound. The first route rule refuses every `*.posthog.com` request for every inbound, so telemetry can never leave the machine regardless of the CLI's own switches.
+- **Startup Enforcement**: Workers and the container entrypoint verify via `app/cli_build.py` — before touching account credentials — that `FREEBUFF_BIN` hashes to the pinned official executable digest. Anything else (a tampered binary, an unaudited new release) is rejected; there is no fallback. See [cli/README.md](cli/README.md).
 
 ### 2. Cross-Platform Hardware Fingerprint Privacy Virtualization (macOS & Linux)
 - **Realistic Synthetic Identifiers**: Every value is deterministic per account ID (`app/hardware_shims.py`) and shaped like genuine hardware: a random-form (v4) UUID — Apple's `IOPlatformUUID` values are random v4 form, never namespace-derived v5 — a 12-character serial from Apple's serial alphabet (which omits `I` and `O`), a genuine model identifier (`Mac15,6`, `MacBookPro18,3`, …), and a per-account `<owner>s-<machine>.local` hostname in the macOS default style. Identical synthetic shapes across all accounts would themselves be a fingerprint.
@@ -526,7 +526,7 @@ All settings can be configured via environment variables or an `.env` file:
 | `FREEBUFF_API_KEY` | `""` | Secret bearer key required by gateway API endpoints; **mandatory for non-loopback binds** (startup refuses otherwise) |
 | `FREEBUFF_API_HOST` | `127.0.0.1` (`.env` example) / `0.0.0.0` (code default) | Server bind host address |
 | `FREEBUFF_API_PORT` | `8000` | Server listen port |
-| `FREEBUFF_BIN` | `.freebuff/private-cli/freebuff` | Absolute path to the verified private CLI executable |
+| `FREEBUFF_BIN` | `.freebuff/official-cli/freebuff` | Absolute path to the pinned official CLI executable (SHA-256 verified) |
 | `FREEBUFF_DEFAULT_MODEL` | `glm-5.3-flash` | Default model when unspecified in requests |
 | `FREEBUFF_WORKER_WORKDIR` | `/tmp/freebuff-api-worker` | Base sandbox root for worker instances |
 | `FREEBUFF_ALLOWED_WORKSPACE_ROOTS` | `""` | Colon-separated allowed filesystem roots for client workspace binding |

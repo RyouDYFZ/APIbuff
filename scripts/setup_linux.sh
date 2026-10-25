@@ -3,9 +3,10 @@
 # One-Command Bare-Metal Linux Deployment Script for Freebuff API Gateway
 # Target OS: Ubuntu 20.04+, Debian 11+, Debian 12
 #
-# Builds a verified private Freebuff CLI (PostHog opt-out embedded) from the
-# pinned 0.2.34 release, installs the gateway under /opt/freebuff-api-service,
-# and installs a systemd unit running as the unprivileged `freebuff` user.
+# Installs the pinned official Freebuff CLI (telemetry is blocked at the
+# gateway proxy, so the executable stays byte-for-byte official), installs the
+# gateway under /opt/freebuff-api-service, and installs a systemd unit running
+# as the unprivileged `freebuff` user.
 # ==============================================================================
 
 set -e
@@ -20,7 +21,7 @@ echo "    Installing Freebuff API Gateway on Linux"
 echo "============================================================"
 
 # 1. Update OS and Install Prerequisites
-echo "[1/7] Installing OS packages (Python, Node.js, Bun, Zsh, Git)..."
+echo "[1/7] Installing OS packages (Python, Zsh, Git, sing-box)..."
 apt-get update -y
 apt-get install -y --no-install-recommends \
     curl \
@@ -36,8 +37,17 @@ apt-get install -y --no-install-recommends \
     gcc \
     libc6-dev
 
-# Bun compiles the private CLI; the pinned launcher is only for OAuth login.
-npm install -g bun@1.3 freebuff@0.2.34
+# The pinned npm launcher is only for OAuth login; workers run the official
+# executable installed in step 4 and egress through the gateway's sing-box.
+npm install -g freebuff@0.2.34
+
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then SB_ARCH="amd64"; elif [ "$ARCH" = "aarch64" ]; then SB_ARCH="arm64"; else SB_ARCH="amd64"; fi
+curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-${SB_ARCH}.tar.gz" -o /tmp/sing-box.tar.gz
+tar -xzf /tmp/sing-box.tar.gz -C /tmp
+mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box
+chmod +x /usr/local/bin/sing-box
+rm -rf /tmp/sing-box*
 
 # 2. Setup Project Directory
 INSTALL_DIR="/opt/freebuff-api-service"
@@ -54,10 +64,10 @@ echo "[3/7] Installing Python dependencies..."
 python3 -m pip install --break-system-packages -r "$INSTALL_DIR/requirements.txt" 2>/dev/null || \
 python3 -m pip install -r "$INSTALL_DIR/requirements.txt"
 
-# 4. Build the verified private CLI from the pinned release archive.
-echo "[4/7] Building the private Freebuff CLI (pinned 0.2.34)..."
-python3 "$INSTALL_DIR/scripts/build_private_cli.py" \
-    --fetch --output /opt/freebuff/private-cli/freebuff
+# 4. Install the pinned official CLI from the verified release archive.
+echo "[4/7] Installing the official Freebuff CLI (pinned 0.2.34)..."
+python3 "$INSTALL_DIR/scripts/fetch_official_cli.py" \
+    --fetch --output /opt/freebuff/official-cli/freebuff
 
 # 5. Configure Credentials
 echo "[5/7] Checking credentials..."

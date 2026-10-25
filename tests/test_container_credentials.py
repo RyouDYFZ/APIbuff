@@ -1,10 +1,8 @@
 """Offline entrypoint and explicit-account credential regression checks."""
 
-import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import shlex
 import subprocess
 import sys
@@ -16,28 +14,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.accounts import AccountManager
-from app.cli_build import AUDITED_BUNDLE_SHA256, PRIVATE_GUARD
-
-# A fixture binary that satisfies entrypoint verification: it embeds the
-# patched PostHog factory shape and carries a matching receipt.
-FIXTURE_BODY = b"fixture build\nif (gatewayPostHogDisabled())\n  return gatewayDisabledPostHogClient();\n"
 
 
-def write_private_cli_fixture(root: Path) -> Path:
-    binary = root / "private-cli" / "freebuff"
+def write_official_cli_fixture(root: Path) -> Path:
+    """A stand-in executable; entrypoint verification is stubbed by the
+    python3 wrapper below because the real check pins the release digest."""
+    binary = root / "official-cli" / "freebuff"
     binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_bytes(FIXTURE_BODY)
+    binary.write_bytes(b"official release bytes\n")
     binary.chmod(0o700)
-    receipt = {
-        "privacy_build_version": 1,
-        "platform": platform.system().lower(),
-        "machine": platform.machine(),
-        "posthog_switch": "CODEBUFF_DISABLE_POSTHOG",
-        "source_bundle_sha256": AUDITED_BUNDLE_SHA256,
-        "guard_sha256": hashlib.sha256(PRIVATE_GUARD.read_bytes()).hexdigest(),
-        "binary_sha256": hashlib.sha256(FIXTURE_BODY).hexdigest(),
-    }
-    binary.with_name(binary.name + ".privacy.json").write_text(json.dumps(receipt))
     return binary
 
 
@@ -62,6 +47,19 @@ class TestContainerCredentialStartup(unittest.TestCase):
             '  echo "TEST_SERVER_DISPATCHED"\n'
             '  exit 0\n'
             'fi\n'
+            # The pinned-digest verification cannot pass against an offline
+            # fixture, so this wrapper stands in for exactly that heredoc;
+            # every other stdin script still runs under the real interpreter.
+            'if [ "$1" = "-" ]; then\n'
+            '  script=$(cat)\n'
+            '  case "$script" in\n'
+            '    *verify_official_cli*)\n'
+            '      echo "Verified pinned official Freebuff CLI: test fixture"\n'
+            '      exit 0\n'
+            '      ;;\n'
+            '  esac\n'
+            f'  printf \'%s\' "$script" | exec {shlex.quote(sys.executable)} -\n'
+            'fi\n'
             f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         python_wrapper.chmod(0o700)
@@ -70,7 +68,7 @@ class TestContainerCredentialStartup(unittest.TestCase):
             "HOME": str(self.root / "home"),
             "FREEBUFF_CONFIG_DIR": str(self.config),
             "FREEBUFF_WORKER_WORKDIR": str(self.workspace),
-            "FREEBUFF_BIN": str(write_private_cli_fixture(self.root)),
+            "FREEBUFF_BIN": str(write_official_cli_fixture(self.root)),
             "PATH": str(bin_dir) + ":/usr/bin:/bin",
         }
         for key in ("CODEBUFF_API_KEY", "FREEBUFF_AUTH_TOKEN", "FREEBUFF_USER_EMAIL"):

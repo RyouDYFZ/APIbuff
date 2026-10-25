@@ -9,7 +9,7 @@ User=freebuff
 Group=freebuff
 WorkingDirectory=/opt/freebuff-api-service
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
-Environment="FREEBUFF_BIN=/opt/freebuff/private-cli/freebuff"
+Environment="FREEBUFF_BIN=/opt/freebuff/official-cli/freebuff"
 EnvironmentFile=-/opt/freebuff-api-service/.env
 # Loopback by default. To expose the service, change the host here and set a
 # strong FREEBUFF_API_KEY in the EnvironmentFile; the gateway itself refuses

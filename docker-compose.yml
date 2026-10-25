@@ -28,7 +28,7 @@ services:
       - FREEBUFF_SUPERVISOR_PS_SHIM=${FREEBUFF_SUPERVISOR_PS_SHIM:-true}
       - CODEBUFF_SHIP_LOGS=false
       - FREEBUFF_SANDBOX_DIR=/var/lib/freebuff/accounts
-      - FREEBUFF_BIN=${FREEBUFF_BIN:-/opt/freebuff/private-cli/freebuff}
+      - FREEBUFF_BIN=${FREEBUFF_BIN:-/opt/freebuff/official-cli/freebuff}
       - FREEBUFF_HARDWARE_PRIVACY=${FREEBUFF_HARDWARE_PRIVACY:-auto}
       - PORT=8000
       

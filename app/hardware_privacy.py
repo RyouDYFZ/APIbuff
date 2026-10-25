@@ -90,6 +90,7 @@ def prepare_profile(account_id):
         'synthetic/product_name': b'Virtual Machine\n',
         'synthetic/product_version': b'1.0\n',
         'synthetic/sys_vendor': b'Cloud Provider\n',
+        'synthetic/address': (identity.get('mac_address', '02:00:00:00:00:01').lower() + '\n').encode(),
     }
     for name, content in shim_sources(identity).items():
         assets['fake_bin/' + name] = content.encode() if isinstance(content, str) else content
@@ -189,10 +190,11 @@ def build_worker_command(args, env, account_id, shell, login, prelude=''):
     }
     if platform_mode == 'linux':
         so_path = ensure_linux_preload_so()
-        if so_path and so_path.is_file():
-            assignments['LD_PRELOAD'] = str(so_path)
-            assignments['FREEBUFF_SYNTHETIC_DIR'] = str(directory)
-            assignments['FREEBUFF_SYNTHETIC_HOSTNAME'] = identity['hostname']
+        if not so_path or not so_path.is_file():
+            raise HardwarePrivacyError('Linux libhardware_privacy.so preload library could not be compiled or found; worker was not started.')
+        assignments['LD_PRELOAD'] = str(so_path)
+        assignments['FREEBUFF_SYNTHETIC_DIR'] = str(directory)
+        assignments['FREEBUFF_SYNTHETIC_HOSTNAME'] = identity['hostname']
 
     env.update(assignments)
     env['PATH'] = str(directory / 'fake_bin') + ':' + env.get('PATH', os.defpath)

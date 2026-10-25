@@ -41,10 +41,15 @@ def hardware_identity(account_id):
     machine_name, model = MAC_MODELS[seed[0] % len(MAC_MODELS)]
     owner = HOSTNAME_OWNERS[seed[1] % len(HOSTNAME_OWNERS)]
     hostname = f"{owner}s-{machine_name.lower().replace(' ', '-')}.local"
+    # Locally administered, unicast MAC address (02:xx:xx:xx:xx:xx)
+    first_octet = (generator.getrandbits(8) & 0xFE) | 0x02
+    other_octets = [generator.getrandbits(8) for _ in range(5)]
+    mac_address = ':'.join(f'{b:02x}' for b in [first_octet] + other_octets).lower()
     return {
         'uuid': str(uuid_v4).upper(),
         'serial': ''.join(generator.choice(SERIAL_ALPHABET) for _ in range(12)),
         'hostname': hostname,
+        'mac_address': mac_address,
         'machine_id': hashlib.sha256(('freebuff:machineid:v1:' + account_id).encode()).hexdigest()[:32].lower(),
         'machine_name': machine_name,
         'model': model,
@@ -143,6 +148,9 @@ for arg in "$@"; do
       exit 0 ;;
     *"sys_vendor"*)
       printf "%s\\n" "{identity['machine_name']}"
+      exit 0 ;;
+    *"/net/"*"/address"|*"/sys/"*"/address"|"address")
+      printf "%s\\n" "{identity.get('mac_address', '02:00:00:00:00:01').lower()}"
       exit 0 ;;
   esac
 done

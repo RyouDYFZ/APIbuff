@@ -6,8 +6,7 @@
 extracted_freebuff
 extracted_freebuff_full
 extracted_sources
-# unbuned/unbuned.py MUST ship in the build context: stage 1 uses it to
-# extract the pinned release archive before rebuilding the private CLI.
+unbued
 package
 *.tgz
 *.log

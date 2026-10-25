@@ -5,6 +5,7 @@ import fcntl
 import struct
 import hashlib
 import random
+import time
 import asyncio
 import logging
 import json
@@ -22,7 +23,9 @@ from .config import (
     TURN_TIMEOUT_SECONDS,
     SESSION_BOOT_TIMEOUT_SECONDS,
     TAKEOVER_AUTO_CONFIRM,
+    TAKEOVER_COOLDOWN_SECONDS,
     ADMISSION_AUTO_CONFIRM,
+    MAX_HOURLY_ADMISSION,
     WORKER_SPAWN_MODE,
     USE_LOGIN_SHELL,
     SHELL_PATH,
@@ -36,7 +39,7 @@ from .config import (
 )
 from .cleaner import strip_ansi
 from .terminal_env import get_standard_terminal_env, audit_runtime_environment
-from .cli_build import verify_private_cli
+from .cli_build import verify_official_cli
 from .process_view import RESTORE_SHIM_PATH
 from .git_privacy import prepare_git_privacy_bin
 from .hardware_privacy import build_worker_command
@@ -173,9 +176,11 @@ class FreebuffWorker:
         self.last_jitter_metrics: Optional[JitterMetrics] = None
         self._takeover_scheduled = False
         self._takeover_task = None
+        self._last_takeover_time: float = -999999.0
         self._admission_scheduled = False
         self._admission_task = None
         self._admission_retry_count = 0
+        self._admission_timestamps: List[float] = []
         self._reply_tasks = set()
         self.is_authenticated = True
         self.auth_error_msg: Optional[str] = None
@@ -233,7 +238,7 @@ class FreebuffWorker:
             await self.stop()
 
         ensure_file_descriptor_limit(4096)
-        await asyncio.to_thread(verify_private_cli, FREEBUFF_BIN)
+        await asyncio.to_thread(verify_official_cli, FREEBUFF_BIN)
 
         os.makedirs(self.workdir, exist_ok=True)
         os.makedirs(self.home_dir, exist_ok=True)
@@ -278,8 +283,10 @@ class FreebuffWorker:
         if os.getenv("FREEBUFF_TRUST_AGENTS", "false").lower() == "true":
             args.append("--trust-agents")
         # Login profiles can replace PATH; apply the guard after they finish.
+        # Telemetry is refused by the gateway proxy, not by the CLI itself;
+        # /api/logs shipping stays off through the upstream-supported switch.
         prelude = (
-            "export CODEBUFF_DISABLE_POSTHOG=1 CODEBUFF_SHIP_LOGS=false; "
+            "export CODEBUFF_SHIP_LOGS=false; "
             f"export PATH={shlex.quote(git_privacy_bin)}:\"$PATH\"; " + RESTORE_SHIM_PATH
         )
         command = await asyncio.to_thread(
@@ -423,10 +430,23 @@ class FreebuffWorker:
             # Check for takeover modal prompt
             if TAKEOVER_AUTO_CONFIRM:
                 if b"take over" in text_lower or b"takeover" in text_lower:
-                    if not self._takeover_scheduled:
-                        self._takeover_scheduled = True
-                        logger.info("Detected takeover dialog. Scheduling cognitive delay before confirming...")
-                        self._takeover_task = asyncio.create_task(self._delayed_takeover_confirm())
+                    now = time.monotonic()
+                    if now - self._last_takeover_time < TAKEOVER_COOLDOWN_SECONDS:
+                        if not self._takeover_scheduled:
+                            logger.warning(
+                                "Repeated takeover dialog within cooldown window (%.1fs < %ds) for account '%s'. "
+                                "Refusing takeover to prevent upstream ping-pong ban.",
+                                now - self._last_takeover_time,
+                                TAKEOVER_COOLDOWN_SECONDS,
+                                self.account_id,
+                            )
+                            self.ready_event.set()
+                    else:
+                        if not self._takeover_scheduled:
+                            self._takeover_scheduled = True
+                            self._last_takeover_time = now
+                            logger.info("Detected takeover dialog. Scheduling cognitive delay before confirming...")
+                            self._takeover_task = asyncio.create_task(self._delayed_takeover_confirm())
 
             # Check for admission confirmation modal (model change, wallet hour deduction, retry)
             if ADMISSION_AUTO_CONFIRM:
@@ -445,9 +465,22 @@ class FreebuffWorker:
                                 logger.info("Detected admission retry dialog. Scheduling cognitive delay before retrying...")
                                 self._admission_task = asyncio.create_task(self._delayed_admission_confirm())
                         else:
-                            self._admission_scheduled = True
-                            logger.info("Detected admission confirmation dialog. Scheduling cognitive delay before confirming...")
-                            self._admission_task = asyncio.create_task(self._delayed_admission_confirm())
+                            now = time.monotonic()
+                            self._admission_timestamps = [t for t in self._admission_timestamps if now - t < 3600.0]
+                            if len(self._admission_timestamps) >= MAX_HOURLY_ADMISSION:
+                                logger.warning(
+                                    "Hourly admission/spend confirmation limit reached (%d/%d) for account '%s'. "
+                                    "Pausing auto-confirm to protect quota.",
+                                    len(self._admission_timestamps),
+                                    MAX_HOURLY_ADMISSION,
+                                    self.account_id,
+                                )
+                                self.ready_event.set()
+                            else:
+                                self._admission_timestamps.append(now)
+                                self._admission_scheduled = True
+                                logger.info("Detected admission confirmation dialog. Scheduling cognitive delay before confirming...")
+                                self._admission_task = asyncio.create_task(self._delayed_admission_confirm())
 
             # Check for login prompt (unauthenticated / expired token)
             if b"Press ENTER to login" in self._raw_buffer or b"Press enter to login" in self._raw_buffer:
@@ -653,10 +686,27 @@ class FreebuffWorker:
                 "This Freebuff session was taken over elsewhere.",
                 error_code="session_superseded",
             )
-        if ("take over" in text or "takeover" in text) and not TAKEOVER_AUTO_CONFIRM:
-            raise FreebuffInteractionRequiredError("CLI session takeover requires explicit user action.")
-        if ("confirm and send" in text or "enter: confirm" in text) and not ADMISSION_AUTO_CONFIRM:
-            raise FreebuffInteractionRequiredError("CLI model admission requires explicit user confirmation.")
+        if ("take over" in text or "takeover" in text):
+            if not TAKEOVER_AUTO_CONFIRM:
+                raise FreebuffInteractionRequiredError("CLI session takeover requires explicit user action.")
+            now = time.monotonic()
+            if now - self._last_takeover_time < TAKEOVER_COOLDOWN_SECONDS and not self._takeover_scheduled:
+                raise FreebuffInteractionRequiredError(
+                    f"Session takeover refused: repeated takeover within {TAKEOVER_COOLDOWN_SECONDS}s cooldown. "
+                    "Another active client may be using this account.",
+                    error_code="takeover_cooldown",
+                )
+        if ("confirm and send" in text or "enter: confirm" in text):
+            if not ADMISSION_AUTO_CONFIRM:
+                raise FreebuffInteractionRequiredError("CLI model admission requires explicit user confirmation.")
+            now = time.monotonic()
+            recent_admissions = [t for t in self._admission_timestamps if now - t < 3600.0]
+            if len(recent_admissions) >= MAX_HOURLY_ADMISSION and not self._admission_scheduled:
+                raise FreebuffInteractionRequiredError(
+                    f"Hourly model admission/spend confirmation limit ({MAX_HOURLY_ADMISSION}/hr) reached. "
+                    "Auto-confirm paused to protect account quota.",
+                    error_code="admission_rate_limited",
+                )
         if "load and run these? [y/n]" in text:
             raise FreebuffInteractionRequiredError()
 

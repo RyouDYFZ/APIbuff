@@ -206,7 +206,7 @@ class GitPrivacyWorkerTests(unittest.IsolatedAsyncioTestCase):
             login_shell.chmod(0o700)
             worker = FreebuffWorker(workdir=str(repo), home_dir=str(home))
             with patch.dict(os.environ, dict(env, FREEBUFF_HARDWARE_PRIVACY="off"), clear=True), \
-                 patch("app.worker.verify_private_cli"), \
+                 patch("app.worker.verify_official_cli"), \
                  patch("app.worker.FREEBUFF_BIN", str(fake_cli)), \
                  patch("app.worker.SHELL_PATH", str(login_shell)), \
                  patch("app.worker.USE_LOGIN_SHELL", True), \

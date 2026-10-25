@@ -267,18 +267,19 @@ class TestProxyEndpointAccountAdmission(EndpointEnvironmentTestCase):
         config = start.call_args.args[0]
         self.assertEqual([inbound["listen"] for inbound in config["inbounds"]], ["127.0.0.1"] * 2)
 
-    def test_alias_mismatch_blocks_bound_accounts_but_keeps_explicit_proxy_usable(self):
+    def test_alias_mismatch_blocks_every_bound_account(self):
+        # Explicit-proxy accounts are chained behind the gateway inbound too,
+        # so a broken local endpoint fails closed for them as well.
         self.write_accounts(explicit=True)
         with patch.dict(os.environ, {"FREEBUFF_PROXY_HOST": "proxy.internal"}), patch(
             "app.proxy_manager._resolve_proxy_host", return_value={"192.168.1.50"},
         ), patch.object(self.proxy, "start_singbox") as start:
             accounts = self.manager.load_accounts()
         start.assert_not_called()
-        for account in accounts[:2]:
+        for account in accounts:
             self.assertEqual(account.status, "proxy_error")
             self.assertIsNone(account.assigned_proxy)
-        self.assertEqual(accounts[2].assigned_proxy, "http://explicit-proxy.invalid:8080")
-        self.assertEqual(self.manager.get_healthy_accounts(), [accounts[2]])
+        self.assertEqual(self.manager.get_healthy_accounts(), [])
 
     def test_daemon_failure_does_not_publish_prepared_alias_urls(self):
         self.write_accounts()

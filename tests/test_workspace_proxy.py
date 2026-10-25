@@ -205,16 +205,28 @@ class TestRequiredAccountProxies(unittest.TestCase):
         self.assertIn("already assigned to another account", accounts[1].last_error)
         self.assertEqual(len(self.manager.get_healthy_accounts()), 1)
 
-    def test_explicit_proxy_is_usable_even_when_unrelated_subscription_fails(self):
+    def test_explicit_proxy_is_chained_behind_the_gateway_inbound(self):
+        # The operator's endpoint stays the exit, but the CLI now talks to the
+        # gateway's own inbound, so the telemetry block rules still apply.
         endpoint = "http://private-user:private-password@127.0.0.1:1080"
         self.write_config([{"proxy": endpoint}, {"id": "disabled", "enabled": False, "token": ""}], "https://subscription.invalid")
-        with patch.object(self.proxy, "fetch_subscription", return_value=[]):
+        with patch.object(self.proxy, "fetch_subscription", return_value=[]), patch.object(self.proxy, "start_singbox", return_value=True) as start:
             accounts = self.manager.load_accounts()
         self.assertEqual(accounts[0].status, "idle")
-        self.assertEqual(accounts[0].assigned_proxy, endpoint)
-        self.assertEqual(accounts[0].to_dict()["assigned_proxy"], "http://127.0.0.1:1080")
+        self.assertEqual(accounts[0].assigned_proxy, "http://127.0.0.1:20001")
+        self.assertEqual(accounts[0].assigned_node_name, "Explicit Proxy")
+        self.assertEqual(accounts[0].to_dict()["assigned_proxy"], "http://127.0.0.1:20001")
         self.assertEqual(accounts[1].status, "disabled")
         self.seed.assert_called_once_with(accounts[0])
+        config = start.call_args.args[0]
+        # Outbounds[0] is the telemetry block; the account's chained proxy
+        # follows it.
+        outbound = config["outbounds"][1]
+        self.assertEqual(outbound["type"], "http")
+        self.assertEqual(outbound["server"], "127.0.0.1")
+        self.assertEqual(outbound["server_port"], 1080)
+        self.assertEqual(outbound["username"], "private-user")
+        self.assertEqual(outbound["password"], "private-password")
 
     def test_explicit_invalid_proxy_rejects_config_before_seeding(self):
         self.write_config([{"proxy": "file:///private-token"}])

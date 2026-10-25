@@ -29,6 +29,7 @@ class HardwareProfileTests(unittest.TestCase):
         self.assertNotEqual(first['uuid'], second['uuid'])
         self.assertNotEqual(first['serial'], second['serial'])
         self.assertNotEqual(first['machine_id'], second['machine_id'])
+        self.assertNotEqual(first['mac_address'], second['mac_address'])
         # A random (v4) UUID shape, an Apple-alphabet serial without I/O, a
         # real model identifier, and a per-account .local hostname: values
         # shaped like genuine hardware rather than one shared synthetic form.
@@ -37,6 +38,9 @@ class HardwareProfileTests(unittest.TestCase):
         self.assertNotIn('I', first['serial'])
         self.assertNotIn('O', first['serial'])
         self.assertRegex(first['machine_id'], r'^[a-f0-9]{32}$')
+        self.assertRegex(first['mac_address'], r'^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+        # Locally administered (bit 1 is 1) and unicast (bit 0 is 0)
+        self.assertEqual(int(first['mac_address'].split(':')[0], 16) & 0x03, 0x02)
         self.assertRegex(first['hostname'], r'^[a-z0-9][a-z0-9-]*\.local$')
         self.assertNotEqual(first['hostname'], second['hostname'])
         self.assertIn(first['model'], ('Mac15,6', 'MacBookPro18,3', 'Mac14,2', 'Mac14,9', 'Macmini9,1', 'iMac21,1'))
@@ -72,6 +76,9 @@ class HardwareProfileTests(unittest.TestCase):
         serial_output = subprocess.check_output([str(directory / 'fake_bin/cat'), '/sys/class/dmi/id/product_serial'], env=env, text=True).strip()
         self.assertEqual(serial_output, identity['serial'])
 
+        mac_output = subprocess.check_output([str(directory / 'fake_bin/cat'), '/sys/class/net/eth0/address'], env=env, text=True).strip()
+        self.assertEqual(mac_output.lower(), identity['mac_address'].lower())
+
         # Passthrough cat for normal files
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
             f.write('regular file content 42')
@@ -95,6 +102,7 @@ class HardwareProfileTests(unittest.TestCase):
         self.assertEqual((directory / 'synthetic/machine-id').stat().st_mode & 0o777, 0o600)
         self.assertEqual((directory / 'synthetic/machine-id').read_text().strip(), identity['machine_id'])
         self.assertEqual((directory / 'synthetic/product_uuid').read_text().strip(), identity['uuid'].lower())
+        self.assertEqual((directory / 'synthetic/address').read_text().strip(), identity['mac_address'].lower())
 
     def test_platform_policy_and_inherited_runtime_flags(self):
         env = dict(os.environ, FREEBUFF_HARDWARE_PRIVACY='off', BUN_OPTIONS='bad', BUN_BE_BUN='1', NODE_OPTIONS='bad', FREEBUFF_DEVICE_PROBE='1')
@@ -147,6 +155,9 @@ class LinuxHardwareRuntimeTests(unittest.TestCase):
             elf_bin.write_bytes(b'\x7fELF\x02\x01\x01\x00' + b'\x00' * 16)
             elf_bin.chmod(0o700)
 
+            mock_so = Path(temporary) / 'libhardware_privacy.so'
+            mock_so.touch(mode=0o700)
+
             # Mock successful probe
             mock_proc = MagicMock()
             mock_proc.communicate.return_value = (PROBE_MARKER, '')
@@ -154,6 +165,7 @@ class LinuxHardwareRuntimeTests(unittest.TestCase):
             mock_proc.__enter__.return_value = mock_proc
 
             with patch('app.hardware_privacy.sys.platform', 'linux'), \
+                 patch('app.hardware_privacy.ensure_linux_preload_so', return_value=mock_so), \
                  patch('app.hardware_privacy.subprocess.Popen', return_value=mock_proc):
                 env = {'FREEBUFF_HARDWARE_PRIVACY': 'auto'}
                 command = build_worker_command([str(elf_bin), '--arg1'], env, 'account-linux-1', '/bin/sh', False)
@@ -164,7 +176,19 @@ class LinuxHardwareRuntimeTests(unittest.TestCase):
                 self.assertIn('BUN_OPTIONS', env)
                 self.assertIn('--preload=', env['BUN_OPTIONS'])
                 self.assertEqual(env['HOSTNAME'], hardware_identity('account-linux-1')['hostname'])
+                self.assertEqual(env['LD_PRELOAD'], str(mock_so))
                 self.assertIn('fake_bin', env['PATH'])
+
+    def test_linux_fails_closed_when_preload_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            elf_bin = Path(temporary) / 'fake-elf'
+            elf_bin.write_bytes(b'\x7fELF\x02\x01\x01\x00' + b'\x00' * 16)
+            elf_bin.chmod(0o700)
+
+            with patch('app.hardware_privacy.sys.platform', 'linux'), \
+                 patch('app.hardware_privacy.ensure_linux_preload_so', return_value=None):
+                with self.assertRaisesRegex(HardwarePrivacyError, 'libhardware_privacy.so preload library could not be compiled or found'):
+                    build_worker_command([str(elf_bin)], {'FREEBUFF_HARDWARE_PRIVACY': 'auto'}, 'test', '/bin/sh', False)
 
     def test_linux_preload_virtualization_in_node(self):
         node = shutil.which('node') or os.path.expanduser('~/.nvm/versions/node/v26.5.0/bin/node')
@@ -197,7 +221,7 @@ class MacHardwareRuntimeTests(unittest.TestCase):
             from app.worker import FreebuffWorker
             with tempfile.TemporaryDirectory() as temporary:
                 worker = FreebuffWorker(workdir=temporary, home_dir=temporary + '/home')
-                with patch('app.worker.verify_private_cli'), patch.object(worker, '_ensure_git_repo'), patch('app.worker.build_worker_command', side_effect=HardwarePrivacyError('blocked')), patch('app.worker.pty.openpty') as terminal:
+                with patch('app.worker.verify_official_cli'), patch.object(worker, '_ensure_git_repo'), patch('app.worker.build_worker_command', side_effect=HardwarePrivacyError('blocked')), patch('app.worker.pty.openpty') as terminal:
                     with self.assertRaises(HardwarePrivacyError):
                         await worker.start()
                     terminal.assert_not_called()
@@ -256,7 +280,7 @@ setInterval(() => {}, 1000);
             async def exercise_worker():
                 from app.worker import FreebuffWorker
                 worker = FreebuffWorker(workdir=str(directory), home_dir=str(directory / "account's home"), account_id='offline-worker')
-                with patch.dict(os.environ, {'FREEBUFF_HARDWARE_PRIVACY': 'macos'}), patch('app.worker.FREEBUFF_BIN', str(binary)), patch('app.worker.SHELL_PATH', '/bin/zsh'), patch('app.worker.USE_LOGIN_SHELL', True), patch('app.worker.verify_private_cli'), patch.object(worker, '_ensure_git_repo'):
+                with patch.dict(os.environ, {'FREEBUFF_HARDWARE_PRIVACY': 'macos'}), patch('app.worker.FREEBUFF_BIN', str(binary)), patch('app.worker.SHELL_PATH', '/bin/zsh'), patch('app.worker.USE_LOGIN_SHELL', True), patch('app.worker.verify_official_cli'), patch.object(worker, '_ensure_git_repo'):
                     try:
                         await worker.start()
                         fields = json.loads((directory / 'fixture-result.json').read_text())

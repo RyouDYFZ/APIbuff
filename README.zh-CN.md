@@ -64,12 +64,12 @@ Freebuff CLI 会采集并上报一些环境与输入特征信息。
 
 - Python 3.11+
 
-- 私有 Freebuff CLI 构建（`scripts/build_private_cli.py`）
+- 钉住的官方 Freebuff CLI（`scripts/fetch_official_cli.py`）
 
   > [!NOTE]
-  > 工作进程在官方 CLI 上会安全失败（fail closed），因为官方 CLI 编译进二进制的 PostHog 遥测会忽略所有停用开关。
+  > 工作进程只运行字节级一致的官方发布版 —— 其编译进二进制的 PostHog 遥测会忽略所有停用开关，因此改为在网关代理层拦截。
 
-- `PATH` 中有 Bun（`npm install -g bun@1.3`，用于构建私有 CLI）
+- `PATH` 中有 sing-box（网关代理：隔离每账号出口并阻断遥测）
 
 ### 2. 安装依赖
 ```bash
@@ -80,18 +80,18 @@ pip install -r requirements.txt
 pip install -r requirements.lock
 ```
 
-### 3. 构建私有验证 CLI（必需）
-下载固定的官方 0.2.34 发布归档，校验其 SHA-256，解压并以内嵌 PostHog 停用补丁重新构建：
+### 3. 安装钉住的官方 CLI（必需）
+下载固定的官方 0.2.34 发布归档，按 `cli/freebuff-0.2.34-binary-checksums.json` 校验归档与可执行文件的 SHA-256 后原样安装：
 ```bash
-python3 scripts/build_private_cli.py --fetch
+python3 scripts/fetch_official_cli.py --fetch
 ```
-该命令会生成 `.freebuff/private-cli/freebuff` 及其 `freebuff.privacy.json` 验证回执。验证要求停用补丁**位于二进制内部**，因此为官方二进制生成的回执会被拒绝。Docker 镜像会自动执行该构建阶段（Linux x64/arm64）；参见 [cli/README.md](cli/README.md)。
+该命令会安装 `.freebuff/official-cli/freebuff`。任何摘要未被钉住的可执行文件都会被工作进程拒绝，升级因此始终是显式动作。Docker 镜像会自动执行该步骤（Linux x64/arm64）；参见 [cli/README.md](cli/README.md)。
 
 ### 4. 登录认证（令牌过期时）
 ```bash
 ./login.sh
 ```
-按浏览器提示完成 OAuth 登录。该脚本优先使用已验证的私有 CLI；令牌存储在 CLI profile 中，或配置到 `.env`。
+按浏览器提示完成 OAuth 登录。该脚本优先使用钉住的官方 CLI；令牌存储在 CLI profile 中，或配置到 `.env`。
 
 ### 5. 启动服务
 ```bash
@@ -366,11 +366,11 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 Freebuff CLI 内置了激进的客户端遥测、硬件探测与父进程检查。APIbuff 在 macOS 与 Linux 上都提供了全面的隐私防护：
 
-### 1. PostHog 遥测停用与私有 CLI 构建验证
+### 1. 代理层遥测阻断与官方 CLI 验证
 - **上游**：官方 CLI 构建把 PostHog 项目密钥与 API 端点直接硬编码进 bundle 字面量。设置 `NEXT_PUBLIC_POSTHOG_API_KEY=""` 之类的环境变量对编译后的可执行文件毫无作用。设置 `CODEBUFF_SHIP_LOGS=false` 只会禁用 `/api/logs`，PostHog 与 Axiom 追踪依然活跃。
-- **私有构建修复**：`scripts/build_private_cli.py` 使用 Bun `--env=disable` 重新构建固定的官方 0.2.34 发布（归档 SHA-256、每个目标的 JavaScript 摘要以及每个内嵌资产摘要均通过 `cli/freebuff-0.2.34-binary-checksums.json` 与 `cli/assets-0.2.34-*.json` 固定）。Docker 镜像会为 Linux x64/arm64 自动完成该构建。
-- **运行时拦截**：当存在 `CODEBUFF_DISABLE_POSTHOG=1` 或 `CODEBUFF_SHIP_LOGS=false` 时，`cli/posthog-opt-out.js` 会在进程初始化时注入不可变的空操作（no-op）PostHog 客户端，在 SDK 初始化前中和所有 `capture`、`identify`、`alias`、`captureException` 与 `flush` 钩子。
-- **启动强制校验**：工作进程与容器入口点会在接触账户凭据之前，通过 `app/cli_build.py` 验证二进制**内嵌了打过补丁的 PostHog 工厂**并携带匹配的回执。为官方二进制生成的回执会被拒绝；不存在回退到 npm 启动器或官方可执行文件的路径。参见 [cli/README.md](cli/README.md)。
+- **零补丁策略**：网关按字节原样运行官方可执行文件 —— 不反解、不重编译、不重打包、不重签名，官方原生签名、内嵌资产与启动时序全部保持原状，版本升级只是重新钉住一次下载。`scripts/fetch_official_cli.py` 在按 `cli/freebuff-0.2.34-binary-checksums.json` 校验归档与可执行文件 SHA-256 后安装固定的 0.2.34 发布。Docker 镜像会为 Linux x64/arm64 自动完成该步骤。
+- **网络层强制**：所有账号的外发都经过网关自有的 sing-box 入站（`app/proxy_manager.py`）：订阅账号走匹配节点、显式代理串接在入站之后、无代理账号获得 direct 出站。首条路由规则对所有入站拒绝全部 `*.posthog.com` 请求，因此无论 CLI 自身开关如何，遥测都离不开本机。
+- **启动强制校验**：工作进程与容器入口点会在接触账户凭据之前，通过 `app/cli_build.py` 验证 `FREEBUFF_BIN` 的 SHA-256 等于钉住的官方摘要。任何其他文件（被篡改的二进制、未审计的新版本）都会被拒绝；不存在回退路径。参见 [cli/README.md](cli/README.md)。
 
 ### 2. 跨平台硬件指纹隐私虚拟化（macOS 与 Linux）
 - **逼真的合成标识符**：每个值都按账户 ID 确定性生成（`app/hardware_shims.py`），且形状与真实硬件一致：随机形式（v4）UUID——Apple 的 `IOPlatformUUID` 值是随机 v4 形式，绝非命名空间派生的 v5——来自 Apple 序列号字母表（省略 `I` 和 `O`）的 12 位序列号、真实的机型标识符（`Mac15,6`、`MacBookPro18,3` 等），以及 macOS 默认风格的 `<owner>s-<machine>.local` 主机名。所有账户共享同样的合成形状本身就是一种指纹。
@@ -526,7 +526,7 @@ docker compose --env-file .env.alpha -f docker-compose.account.yml -p freebuff-a
 | `FREEBUFF_API_KEY` | `""` | 网关 API 端点所需的 Bearer 密钥；**非回环绑定时强制要求**（否则拒绝启动） |
 | `FREEBUFF_API_HOST` | `127.0.0.1`（`.env` 示例）/ `0.0.0.0`（代码默认） | 服务绑定主机地址 |
 | `FREEBUFF_API_PORT` | `8000` | 服务监听端口 |
-| `FREEBUFF_BIN` | `.freebuff/private-cli/freebuff` | 已验证私有 CLI 可执行文件的绝对路径 |
+| `FREEBUFF_BIN` | `.freebuff/official-cli/freebuff` | 钉住的官方 CLI 可执行文件绝对路径（SHA-256 校验） |
 | `FREEBUFF_DEFAULT_MODEL` | `glm-5.3-flash` | 请求未指定模型时的默认模型 |
 | `FREEBUFF_WORKER_WORKDIR` | `/tmp/freebuff-api-worker` | 工作进程实例的基础沙箱根目录 |
 | `FREEBUFF_ALLOWED_WORKSPACE_ROOTS` | `""` | 冒号分隔的客户端工作区绑定允许的文件系统根目录 |

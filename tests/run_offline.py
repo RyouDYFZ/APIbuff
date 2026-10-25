@@ -19,6 +19,7 @@ PATTERNS = (
     "test_terminal_colors.py",
     "test_response_attachments.py",
     "test_isolation_guards.py",
+    "test_telemetry_blocklist.py",
     "test_git_privacy.py",
     "test_multi_account_pool.py",
     "test_catalog_truth.py",

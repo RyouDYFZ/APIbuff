@@ -12,16 +12,45 @@ const identity = JSON.parse(fs.readFileSync(path.join(__dirname, 'identity.json'
 if (!/^[A-F0-9-]{36}$/i.test(identity.uuid) ||
     !/^[A-HJ-NP-Z0-9]{12}$/.test(identity.serial) ||
     (identity.machine_id && !/^[a-f0-9]{32}$/.test(identity.machine_id)) ||
+    (identity.mac_address && !/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(identity.mac_address)) ||
     !/^[a-z0-9][a-z0-9-]{0,30}\.local$/.test(identity.hostname)) {
   throw new Error('Invalid worker hardware privacy profile')
 }
 if (!identity.machine_id) {
   identity.machine_id = identity.uuid.replace(/-/g, '').toLowerCase()
 }
+if (!identity.mac_address) {
+  const hash = require('node:crypto').createHash('sha256').update(identity.uuid).digest('hex')
+  identity.mac_address = `02:${hash.slice(2, 4)}:${hash.slice(4, 6)}:${hash.slice(6, 8)}:${hash.slice(8, 10)}:${hash.slice(10, 12)}`.toLowerCase()
+}
 
 os.hostname = () => identity.hostname
 process.env.HOSTNAME = identity.hostname
 process.env.HOST = identity.hostname
+
+// Virtualize MAC address via os.networkInterfaces
+const primaryIf = process.platform === 'darwin' ? 'en0' : 'eth0'
+const syntheticMac = identity.mac_address.toLowerCase()
+os.networkInterfaces = function () {
+  return {
+    lo0: [{
+      address: '127.0.0.1',
+      netmask: '255.0.0.0',
+      family: 'IPv4',
+      mac: '00:00:00:00:00:00',
+      internal: true,
+      cidr: '127.0.0.1/8'
+    }],
+    [primaryIf]: [{
+      address: '192.168.1.100',
+      netmask: '255.255.255.0',
+      family: 'IPv4',
+      mac: syntheticMac,
+      internal: false,
+      cidr: '192.168.1.100/24'
+    }]
+  }
+}
 
 // Virtualize Linux hardware features via Node fs module for JS consumers
 const SYNTHETIC_MAP = {
@@ -37,6 +66,10 @@ const SYNTHETIC_MAP = {
 
 function matchSynthetic(targetPath) {
   if (typeof targetPath !== 'string') return null
+  if ((targetPath.endsWith('/address') || targetPath.endsWith('address')) &&
+      (targetPath.includes('/net/') || targetPath.includes('/sys/'))) {
+    return identity.mac_address.toLowerCase()
+  }
   for (const [key, getter] of Object.entries(SYNTHETIC_MAP)) {
     if (targetPath === key || targetPath.endsWith('/' + key)) {
       return getter()
@@ -270,7 +303,17 @@ if (process.env.FREEBUFF_DEVICE_PROBE === '1') {
 
       const fsUuid = fs.readFileSync('/sys/class/dmi/id/product_uuid', 'utf8').trim()
       assert.equal(fsUuid.toLowerCase(), identity.uuid.toLowerCase())
+
+      const macOut = importedCP.execSync('cat /sys/class/net/eth0/address', { encoding: 'utf8' }).trim()
+      assert.equal(macOut.toLowerCase(), identity.mac_address.toLowerCase())
+
+      const fsMac = fs.readFileSync('/sys/class/net/eth0/address', 'utf8').trim()
+      assert.equal(fsMac.toLowerCase(), identity.mac_address.toLowerCase())
     }
+
+    const probeIfaces = importedOS.networkInterfaces()
+    const probeMacs = Object.values(probeIfaces).flat().map(i => i.mac).filter(m => m && m !== '00:00:00:00:00:00')
+    assert(probeMacs.includes(identity.mac_address.toLowerCase()))
 
     process.stdout.write('FREEBUFF_DEVICE_PROBE_OK_v1\n')
     process.exit(0)

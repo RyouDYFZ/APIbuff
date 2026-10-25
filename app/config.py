@@ -3,7 +3,7 @@ import platform
 import shutil
 from pathlib import Path
 
-from .cli_build import PRIVATE_CLI
+from .cli_build import OFFICIAL_CLI
 
 # Server settings
 HOST = os.getenv("FREEBUFF_API_HOST", "0.0.0.0")
@@ -14,9 +14,9 @@ API_KEY = os.getenv("FREEBUFF_API_KEY") or os.getenv("API_KEY", "")  # Gateway a
 CODEBUFF_API_KEY = os.getenv("CODEBUFF_API_KEY") or os.getenv("FREEBUFF_AUTH_TOKEN", "")
 
 # Binary and workspace settings
-# Worker startup checks the build receipt before using account credentials.
-# The official executable and npm launcher do not honour the privacy switch.
-DEFAULT_BIN = str(PRIVATE_CLI)
+# Workers run the pinned official executable byte-for-byte; telemetry is
+# blocked at the gateway proxy and startup verifies the pinned SHA-256.
+DEFAULT_BIN = str(OFFICIAL_CLI)
 if platform.system() != "Darwin" and not os.getenv("FREEBUFF_BIN"):
     candidate = Path.home() / ".config" / "manicode" / "freebuff"
     if candidate.is_file():
@@ -27,10 +27,12 @@ WORKER_WORKDIR = os.getenv("FREEBUFF_WORKER_WORKDIR", "/tmp/freebuff-api-worker"
 
 # Execution settings
 DEFAULT_MODEL = os.getenv("FREEBUFF_DEFAULT_MODEL", "glm-5.3-flash")
-TURN_TIMEOUT_SECONDS = int(os.getenv("FREEBUFF_TURN_TIMEOUT", "120"))
+TURN_TIMEOUT_SECONDS = int(os.getenv("FREEBUFF_TURN_TIMEOUT", "600"))
 SESSION_BOOT_TIMEOUT_SECONDS = int(os.getenv("FREEBUFF_BOOT_TIMEOUT", "20"))
 TAKEOVER_AUTO_CONFIRM = os.getenv("FREEBUFF_TAKEOVER_AUTO_CONFIRM", "true").lower() == "true"
+TAKEOVER_COOLDOWN_SECONDS = int(os.getenv("FREEBUFF_TAKEOVER_COOLDOWN", "600"))
 ADMISSION_AUTO_CONFIRM = os.getenv("FREEBUFF_ADMISSION_AUTO_CONFIRM", "true").lower() == "true"
+MAX_HOURLY_ADMISSION = int(os.getenv("FREEBUFF_MAX_HOURLY_ADMISSION", "5"))
 
 # Hardware Privacy (auto, macos, linux, off)
 FREEBUFF_HARDWARE_PRIVACY = os.getenv("FREEBUFF_HARDWARE_PRIVACY", "auto").strip().lower()

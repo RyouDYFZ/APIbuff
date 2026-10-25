@@ -124,13 +124,15 @@ proxies:
         pm = ProxyManager()
         node1 = ProxyNode("US-Node", "shadowsocks", "1.2.3.4", 8388, {"type": "shadowsocks", "method": "aes-256-gcm", "password": "pass"})
         node2 = ProxyNode("JP-Node", "trojan", "5.6.7.8", 443, {"type": "trojan", "password": "pass", "tls": {"enabled": True}})
+        node3 = ProxyNode.direct()
 
         bindings = [
             {"port": 20001, "node": node1},
-            {"port": 20002, "node": node2}
+            {"port": 20002, "node": node2},
+            {"port": 20003, "node": node3},
         ]
         cfg = pm.build_singbox_config(bindings)
-        
+
         # Check inbounds
         inbound_ports = [ib["listen_port"] for ib in cfg["inbounds"]]
         self.assertIn(20001, inbound_ports)
@@ -140,14 +142,26 @@ proxies:
         outbound_tags = [ob["tag"] for ob in cfg["outbounds"]]
         self.assertIn("out_node_1_shadowsocks", outbound_tags)
         self.assertIn("out_node_2_trojan", outbound_tags)
+        self.assertIn("out_node_3_direct", outbound_tags)
 
-        # Check route rules
+        # Check route rules: the telemetry block rule is always first and
+        # refuses every PostHog domain for every inbound before any account
+        # outbound is considered. The legacy outbound-field dialect keeps the
+        # config valid on the container's sing-box 1.10 as well as newer
+        # releases.
+        from app.proxy_manager import TELEMETRY_BLOCK_DOMAIN_SUFFIXES, TELEMETRY_BLOCK_OUTBOUND_TAG
         rules = cfg["route"]["rules"]
-        self.assertEqual(len(rules), 2)
-        self.assertEqual(rules[0]["inbound"], ["in_acc_1"])
-        self.assertEqual(rules[0]["outbound"], "out_node_1_shadowsocks")
-        self.assertEqual(rules[1]["inbound"], ["in_acc_2"])
-        self.assertEqual(rules[1]["outbound"], "out_node_2_trojan")
+        self.assertEqual(len(rules), 4)
+        self.assertEqual(rules[0]["outbound"], TELEMETRY_BLOCK_OUTBOUND_TAG)
+        self.assertEqual(rules[0]["domain_suffix"], list(TELEMETRY_BLOCK_DOMAIN_SUFFIXES))
+        self.assertEqual(cfg["outbounds"][0]["type"], "block")
+        self.assertEqual(cfg["outbounds"][0]["tag"], TELEMETRY_BLOCK_OUTBOUND_TAG)
+        self.assertEqual(rules[1]["inbound"], ["in_acc_1"])
+        self.assertEqual(rules[1]["outbound"], "out_node_1_shadowsocks")
+        self.assertEqual(rules[2]["inbound"], ["in_acc_2"])
+        self.assertEqual(rules[2]["outbound"], "out_node_2_trojan")
+        self.assertEqual(rules[3]["inbound"], ["in_acc_3"])
+        self.assertEqual(rules[3]["outbound"], "out_node_3_direct")
 
         # If sing-box binary exists, test validation
         if pm.singbox_bin and os.path.exists(pm.singbox_bin):
@@ -184,8 +198,20 @@ proxies:
             json.dump(acc_data, f)
 
         am = AccountManager(config_file=tmp_accounts_file)
-        accounts = am.load_accounts()
+        # Explicit proxies are chained behind the gateway's own sing-box
+        # inbound, so every account needs the daemon (mocked here) even with
+        # no subscription: that inbound is what refuses telemetry egress.
+        with patch("app.accounts.global_proxy_manager") as proxy:
+            proxy.start_singbox.return_value = True
+            proxy.local_proxy_url.side_effect = [
+                "http://127.0.0.1:20001", "http://127.0.0.1:20002",
+            ]
+            accounts = am.load_accounts()
         self.assertEqual(len(accounts), 2)
+        self.assertEqual([account.assigned_proxy for account in accounts],
+                         ["http://127.0.0.1:20001", "http://127.0.0.1:20002"])
+        self.assertEqual([account.assigned_node_name for account in accounts],
+                         ["Explicit Proxy", "Explicit Proxy"])
 
         # Check sandbox 1
         acc1 = am.get_account("acc_isolated_01")

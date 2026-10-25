@@ -91,8 +91,11 @@ class TestIsolationGuards(unittest.TestCase):
             self.assertNotIn(key, env)
         for key in ("TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLORTERM", "SHELL",
                     "HOME", "USER", "LOGNAME", "LANG", "COLUMNS", "LINES", "PATH",
-                    "CODEBUFF_DISABLE_POSTHOG", "CODEBUFF_SHIP_LOGS"):
+                    "CODEBUFF_SHIP_LOGS"):
             self.assertIn(key, env)
+        # The PostHog SDK ignores environment switches; telemetry is refused by
+        # the gateway proxy, so no PostHog variable is ever injected.
+        self.assertNotIn("CODEBUFF_DISABLE_POSTHOG", env)
 
     def test_inherited_or_overridden_cli_trust_cannot_bypass_gateway_opt_in(self):
         for value in ("1", "true", "yes"):

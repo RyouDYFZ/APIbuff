@@ -185,6 +185,77 @@ class TestAdmissionAndFatalModals(unittest.IsolatedAsyncioTestCase):
                 pool.select_worker()
             self.assertEqual(caught.exception.status_code, 403)
 
+    async def test_takeover_cooldown_prevents_repeated_confirm(self):
+        """Takeover auto-confirms once, but repeated prompts within cooldown abort."""
+        written = []
+
+        async def mock_write_all(fd, data):
+            written.append((fd, data))
+
+        with patch("app.worker.write_all", mock_write_all), \
+             patch("app.worker.TAKEOVER_AUTO_CONFIRM", True), \
+             patch("app.worker.ADMISSION_AUTO_CONFIRM", False), \
+             patch("app.worker.TAKEOVER_COOLDOWN_SECONDS", 600), \
+             patch("random.uniform", return_value=0.01):
+
+            # Attempt 1: First takeover should confirm
+            with patch("os.read", return_value=b"Do you want to take over the session? [Enter: confirm]"):
+                self.worker._on_pty_readable()
+            self.assertTrue(self.worker._takeover_scheduled)
+            await self.worker._takeover_task
+            self.assertEqual(written, [(999, b"\r")])
+
+            # Attempt 2: Immediate repeated takeover within cooldown window
+            written.clear()
+            with patch("os.read", return_value=b"Do you want to take over the session? [Enter: confirm]"):
+                self.worker._on_pty_readable()
+            self.assertFalse(self.worker._takeover_scheduled)
+            self.assertEqual(len(written), 0)
+
+            # _check_interaction should now raise FreebuffInteractionRequiredError
+            with self.assertRaises(FreebuffInteractionRequiredError) as caught:
+                self.worker._check_interaction()
+            self.assertIn("takeover within 600s cooldown", str(caught.exception))
+            self.assertEqual(caught.exception.error_code, "takeover_cooldown")
+
+    async def test_admission_hourly_limit_prevents_spend_draining(self):
+        """Admission auto-confirms up to MAX_HOURLY_ADMISSION, then pauses to protect quota."""
+        written = []
+
+        async def mock_write_all(fd, data):
+            written.append((fd, data))
+
+        with patch("app.worker.write_all", mock_write_all), \
+             patch("app.worker.ADMISSION_AUTO_CONFIRM", True), \
+             patch("app.worker.TAKEOVER_AUTO_CONFIRM", False), \
+             patch("app.worker.MAX_HOURLY_ADMISSION", 2), \
+             patch("random.uniform", return_value=0.01):
+
+            # Confirm 1
+            with patch("os.read", return_value=b"Enter: confirm and send"):
+                self.worker._on_pty_readable()
+            await self.worker._admission_task
+
+            # Confirm 2 (hits max 2)
+            with patch("os.read", return_value=b"Enter: confirm and send"):
+                self.worker._on_pty_readable()
+            await self.worker._admission_task
+
+            self.assertEqual(len(written), 2)
+
+            # Confirm 3 (exceeds hourly limit)
+            written.clear()
+            with patch("os.read", return_value=b"Enter: confirm and send"):
+                self.worker._on_pty_readable()
+            self.assertFalse(self.worker._admission_scheduled)
+            self.assertEqual(len(written), 0)
+
+            # _check_interaction should raise rate limit error
+            with self.assertRaises(FreebuffInteractionRequiredError) as caught:
+                self.worker._check_interaction()
+            self.assertIn("Hourly model admission/spend confirmation limit", str(caught.exception))
+            self.assertEqual(caught.exception.error_code, "admission_rate_limited")
+
 
 if __name__ == "__main__":
     unittest.main()

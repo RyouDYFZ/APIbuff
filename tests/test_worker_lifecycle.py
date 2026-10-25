@@ -1,11 +1,9 @@
 """Offline lifecycle regression tests; never launches Freebuff or calls its API."""
 
 import asyncio
-import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import selectors
 import shlex
 import signal
@@ -20,7 +18,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.lifecycle import gateway_control, stop_registered_gateways
-from app.cli_build import AUDITED_BUNDLE_SHA256, PRIVATE_GUARD, sha256_file
 from app.worker import FreebuffWorker
 from app.worker_supervisor import supervise
 
@@ -52,20 +49,9 @@ def make_fake_cli(directory):
     )
     script.write_text(
         "#!/bin/sh\n"
-        "# if (gatewayPostHogDisabled()) return gatewayDisabledPostHogClient();\n"
         f'exec {shlex.quote(sys.executable)} {shlex.quote(str(script_impl))} "$@"\n'
     )
     script.chmod(0o700)
-    # This offline fixture deliberately substitutes for a verified build.
-    script.with_name(script.name + ".privacy.json").write_text(json.dumps({
-        "privacy_build_version": 1,
-        "platform": platform.system().lower(),
-        "machine": platform.machine(),
-        "posthog_switch": "CODEBUFF_DISABLE_POSTHOG",
-        "source_bundle_sha256": AUDITED_BUNDLE_SHA256,
-        "guard_sha256": sha256_file(PRIVATE_GUARD),
-        "binary_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
-    }))
     return script
 
 
@@ -76,7 +62,7 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             directory = Path(temp)
             fake = make_fake_cli(directory)
             worker = FreebuffWorker(workdir=temp, home_dir=str(directory / "home"), token="test-account-token")
-            with patch("app.worker.FREEBUFF_BIN", str(fake)), patch("app.worker.SHELL_PATH", "/bin/sh"), patch("app.worker.USE_LOGIN_SHELL", False), patch.object(worker, "_ensure_git_repo"):
+            with patch("app.worker.FREEBUFF_BIN", str(fake)), patch("app.worker.verify_official_cli"), patch("app.worker.SHELL_PATH", "/bin/sh"), patch("app.worker.USE_LOGIN_SHELL", False), patch.object(worker, "_ensure_git_repo"):
                 try:
                     with patch.dict(os.environ, {"FREEBUFF_CONFIG_DIR": str(directory / "wrong-config"), "CODEBUFF_API_KEY": "different-host-token", "FREEBUFF_AUTH_TOKEN": "different-host-token", "CODEBUFF_DISABLE_POSTHOG": "false", "CODEBUFF_SHIP_LOGS": "true"}):
                         await worker.start()
@@ -85,7 +71,9 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(environment["home"], str(directory / "home"))
                     self.assertFalse(environment["has_api_key"])
                     self.assertFalse(environment["has_auth_token"])
-                    self.assertEqual(environment["posthog_disabled"], "1")
+                    # No PostHog switch is injected: the official CLI ignores
+                    # one, and its telemetry is refused by the gateway proxy.
+                    self.assertIsNone(environment["posthog_disabled"])
                     self.assertEqual(environment["ship_logs"], "false")
                     credentials = json.loads((Path(worker.config_dir) / "credentials.json").read_text())
                     self.assertEqual(credentials["default"]["authToken"], "test-account-token")
@@ -118,7 +106,7 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_exit_fails_and_closes_terminal(self):
         with tempfile.TemporaryDirectory() as temp:
             worker = FreebuffWorker(workdir=temp, home_dir=str(Path(temp) / "home"))
-            with patch("app.worker.verify_private_cli"), patch("app.worker.FREEBUFF_BIN", "/nonexistent/freebuff-test"), patch("app.worker.SHELL_PATH", "/bin/sh"), patch("app.worker.USE_LOGIN_SHELL", False), patch.object(worker, "_ensure_git_repo"):
+            with patch("app.worker.verify_official_cli"), patch("app.worker.FREEBUFF_BIN", "/nonexistent/freebuff-test"), patch("app.worker.SHELL_PATH", "/bin/sh"), patch("app.worker.USE_LOGIN_SHELL", False), patch.object(worker, "_ensure_git_repo"):
                 with self.assertRaisesRegex(RuntimeError, "exited during startup"):
                     await worker.start()
             self.assertFalse(worker.is_running)
@@ -193,6 +181,7 @@ class AbruptExitTests(unittest.TestCase):
                 import asyncio, json
                 import app.worker as module
                 module.FREEBUFF_BIN = {str(fake)!r}
+                module.verify_official_cli = lambda binary: None
                 module.SHELL_PATH = '/bin/sh'
                 module.USE_LOGIN_SHELL = False
                 module.FreebuffWorker._ensure_git_repo = lambda self: None

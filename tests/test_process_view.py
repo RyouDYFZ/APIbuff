@@ -226,7 +226,7 @@ class WorkerProcessViewTests(unittest.IsolatedAsyncioTestCase):
             (home / ".zprofile").write_text("export PATH=/usr/bin:/bin\n")
             worker = FreebuffWorker(workdir=temp, home_dir=str(home))
             with patch("app.worker.FREEBUFF_BIN", str(cli)), \
-                 patch("app.worker.verify_private_cli"), \
+                 patch("app.worker.verify_official_cli"), \
                  patch("app.worker.SHELL_PATH", "/bin/zsh"), \
                  patch("app.worker.USE_LOGIN_SHELL", True), \
                  patch.object(worker, "_ensure_git_repo"), \

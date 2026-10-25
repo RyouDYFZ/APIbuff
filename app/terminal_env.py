@@ -146,10 +146,10 @@ def get_standard_terminal_env(
     # FREEBUFF_TRUST_AGENTS opt-in. A host-wide CLI opt-in must not bypass it.
     env.pop("CODEBUFF_TRUST_AGENT_DIRS", None)
 
-    # Separate controls: /api/logs is upstream-supported; PostHog requires
-    # our verified private CLI build. Preserve local log.jsonl output.
+    # Separate controls: /api/logs is upstream-supported and stays off; the
+    # PostHog SDK ignores every environment switch, so its egress is refused
+    # by the gateway proxy instead (app/proxy_manager).
     env["CODEBUFF_SHIP_LOGS"] = "false"
-    env["CODEBUFF_DISABLE_POSTHOG"] = "1"
     # The gateway owns and closes this PTY; no detached terminal-reset helper is needed.
     env["CODEBUFF_NO_TERMINAL_WATCHDOG"] = "1"
 

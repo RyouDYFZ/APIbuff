@@ -1,88 +1,99 @@
-# Private CLI with a PostHog opt-out
+# Pinned official CLI with proxy-level telemetry blocking
 
 The official Freebuff 0.2.34 bundle hardcodes the PostHog key and host. Setting
 `NEXT_PUBLIC_POSTHOG_API_KEY` or `NEXT_PUBLIC_POSTHOG_HOST_URL` in the worker
 environment does not override those values. `CODEBUFF_SHIP_LOGS=false` only
-controls `/api/logs`.
+controls `/api/logs`. Rebuilding the binary (Bun recompilation or byte
+splicing) breaks the CLI's interactive startup — the TUI paints blank frames —
+so the private-build pipeline was removed entirely.
 
-This local build adds `CODEBUFF_DISABLE_POSTHOG=1` (also accepts `true`). It reads
-the switch once at process startup and returns a no-op client from the shared
-PostHog factory, before SDK construction. This covers CLI and agent SDK events,
-identify/alias, explicit exception capture, automatic exception hooks, and
-flush. Later direnv changes cannot reverse the startup opt-out. Without the
-switch, the original factory behavior is retained.
+**The gateway now runs the official executable byte-for-byte.** Nothing is
+unpacked, rebuilt, repacked or re-signed: the vendor's native signature,
+embedded assets and startup ordering stay intact, and a new release is adopted
+by downloading it and pinning its digests.
 
-The gateway forces both switches after custom environment overrides and after
-login shell profiles. It verifies the build before worker startup, then
-launches the private executable directly. The npm launcher is bypassed: it has
-its own telemetry and can install official updates that remove this patch.
+## Enforcement model
+
+Telemetry is blocked where it must leave the machine — the gateway proxy
+(`app/proxy_manager.py`):
+
+- Every enabled account egresses through a gateway-managed sing-box inbound:
+  subscription accounts through their matched node, explicit `proxy://…`
+  endpoints are chained behind the inbound (the operator's endpoint stays the
+  exit), and proxy-less accounts get a `direct` outbound.
+- The first route rule in every generated config refuses all `*.posthog.com`
+  requests for every inbound, in the legacy outbound-field dialect so the
+  container-pinned sing-box 1.10 and newer releases accept it alike.
+- A failed or missing daemon fails the account closed (`proxy_error`): without
+  the gateway inbound there is no telemetry block, so workers never degrade
+  into direct CLI egress.
+
+What still runs in-process: the CLI constructs its PostHog client and batches
+events locally, but every delivery attempt is refused by the proxy before it
+leaves the machine. `/api/logs` stays off through the upstream-supported
+`CODEBUFF_SHIP_LOGS=false`.
 
 ## Verification model
 
-A receipt alone proves nothing (anyone can write JSON next to a binary), so
-`app/cli_build.py` also requires that the binary itself **embeds the patched
-PostHog factory** (`if (gatewayPostHogDisabled()) return
-gatewayDisabledPostHogClient();`, whitespace-tolerant because Bun reprints the
-bundle). Those guard function names exist only in our patched bundle, so an
-official binary is rejected even when someone generates a receipt for it —
-including the container entrypoint, which fails closed the same way. The
-receipt additionally pins the source JavaScript digest to the per-target values
-in `cli/freebuff-0.2.34-binary-checksums.json`, which also records the SHA-256
-of every official 0.2.34 release archive (mirrored from the npm package's
-`binaryChecksums`, a trust root separate from this repository).
+Workers and the container entrypoint call `app/cli_build.verify_official_cli`
+before touching any account credential: `FREEBUFF_BIN` must hash (SHA-256) to
+the `binary_sha256` section of `cli/freebuff-0.2.34-binary-checksums.json`.
+The registry also pins every official release archive digest (mirrored from
+the npm package's `binaryChecksums`, a trust root separate from this
+repository). A tampered binary, an unaudited new release, or a damaged
+registry is rejected — there is no fallback to the npm launcher or any other
+executable.
 
-## Build
+## Install
 
-Requires Python 3.11+ and Bun on `PATH` (`npm install -g bun@1.3`). Targets:
-`darwin-arm64`, `linux-x64`, `linux-arm64` (must build on the target platform).
+Requires Python 3.11+ and sing-box on `PATH`. Targets: `darwin-arm64`,
+`linux-x64`, `linux-arm64`.
 
 ```sh
-# Recommended: extract and rebuild the pinned official release archive.
-python3 scripts/build_private_cli.py --fetch
+# Recommended: download and verify the pinned official release.
+python3 scripts/fetch_official_cli.py --fetch
 
 # Already downloaded the archive yourself:
-python3 scripts/build_private_cli.py --archive /path/to/freebuff-<target>.tar.gz
-
-# macOS arm64 development convenience: reuse the audited extracted_sources/ tree.
-python3 scripts/build_private_cli.py
+python3 scripts/fetch_official_cli.py --archive /path/to/freebuff-<target>.tar.gz
 ```
 
-The build never executes the CLI and never installs dependencies. It downloads
-only the pinned release archive from `https://codebuff.com`, verifies its
-SHA-256 against `cli/freebuff-0.2.34-binary-checksums.json`, extracts it with
-the committed `unbuned/unbuned.py` (in-process, no subprocess), verifies the
-extracted JavaScript digest and every embedded asset against the per-target
-registry in `cli/assets-0.2.34-*.json`, locates the unique PostHog client
-factory structurally (minifier names differ per target), and refuses to build
-if that coverage changed. Output is `.freebuff/private-cli/freebuff` with an
-adjacent `freebuff.privacy.json` receipt; `--output` selects another location.
-Copy the receipt alongside the executable when moving it. The official
-installed executable is untouched. Bun autoload of `.env`, bunfig, tsconfig,
-and package.json is disabled for this build.
+Output is `.freebuff/official-cli/freebuff` (override with `--output`; the
+file must be named `freebuff`). The script downloads only from
+`https://codebuff.com` (redirects confined to the publisher's hosts), verifies
+the archive SHA-256, then verifies the extracted executable's SHA-256 before
+installing atomically. It never executes the CLI and never installs
+dependencies.
 
-**Container images build this automatically.** The Dockerfile's first stage
-performs exactly the pinned-archive build for the image's platform
-(`linux-x64`/`linux-arm64`) and installs it at
-`/opt/freebuff/private-cli/freebuff`; the entrypoint verifies it before the
-gateway starts. Bare-metal Linux installs do the same via
+**Upgrading to a new release**: download it, audit it, then extend the
+`sha256`/`binary_sha256`/`bundle_sha256` sections of
+`cli/freebuff-0.2.34-binary-checksums.json` (renaming the file to the new
+version and updating `FREEBUFF_VERSION` in `scripts/fetch_official_cli.py` and
+`app/cli_build.py`). Until the digests are pinned, workers refuse the new
+binary. `scripts/render_smoke_check.py` renders the first TUI frame under a
+pty as a release sanity gate (copy the candidate to
+`.freebuff/render-smoke/freebuff` first).
+
+**Container images install this automatically.** The Dockerfile's first stage
+fetches and verifies the pinned release for the image's platform and installs
+it at `/opt/freebuff/official-cli/freebuff`; the entrypoint re-verifies the
+digest before the gateway starts. Bare-metal Linux installs do the same via
 `scripts/setup_linux.sh`.
 
 ## Verify
 
 ```sh
-node --test tests/test_posthog_opt_out.mjs
 FREEBUFF_HARDWARE_PRIVACY=off python3 -m unittest discover -s tests -p 'test_cli_build.py' -v
+FREEBUFF_HARDWARE_PRIVACY=off python3 -m unittest discover -s tests -p 'test_telemetry_blocklist.py' -v
 FREEBUFF_HARDWARE_PRIVACY=off python3 -m unittest discover -s tests -p 'test_worker_lifecycle.py' -v
 ```
 
-The JavaScript tests execute the actual recovered analytics functions using a
-recording SDK substitute and compile a small executable to check runtime flag
-behavior. Python tests verify receipt rejection (including receipts forged
-against official binaries), environment precedence, and delivery through a
-real worker/shell to an offline fake CLI. The lifecycle tests turn off the
-separate hardware probe because their CLI is a Python fixture. None of these
-tests authenticate or submit an upstream prompt.
+The Python tests verify digest rejection (unknown, tampered and non-executable
+binaries), the telemetry block rule's position and coverage, explicit-proxy
+chaining, fail-closed daemon behavior, environment precedence, and delivery
+through a real worker/shell to an offline fake CLI. The lifecycle tests turn
+off the separate hardware probe because their CLI is a Python fixture. None of
+these tests authenticate or submit an upstream prompt.
 
-Restart the intended gateway to use new code and its private executable. This
-build process does not restart services or modify running workers. Disabling
-PostHog does not remove identifiers from normal login or inference requests.
+Restart the intended gateway to use a newly installed executable. Installing a
+release does not restart services or modify running workers. Blocking PostHog
+egress does not remove identifiers from normal login or inference requests.

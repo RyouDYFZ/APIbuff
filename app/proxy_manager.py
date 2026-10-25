@@ -35,6 +35,13 @@ SINGBOX_CHECK_TIMEOUT_SECONDS = 10
 SINGBOX_STARTUP_GRACE_SECONDS = 0.2
 PROXY_HOST_LOOKUP_TIMEOUT_SECONDS = 5
 
+# The official CLI ships active PostHog telemetry and honours no environment
+# switch, so the gateway's proxy is the enforcement point: every request for
+# these domains is refused before it can leave the machine. A suffix entry
+# covers every subdomain, which is what the CLI's us.i/us-assets.i hosts need.
+TELEMETRY_BLOCK_DOMAIN_SUFFIXES = ("posthog.com",)
+TELEMETRY_BLOCK_OUTBOUND_TAG = "telemetry-block"
+
 
 def _resolve_proxy_host(host: str) -> set[str]:
     """Bound the system resolver without leaving a blocked resolver thread behind."""
@@ -159,12 +166,50 @@ class ProxyNode:
 
     def to_singbox_outbound(self, tag: str) -> Dict[str, Any]:
         """Converts internal node definition into standard Sing-box outbound configuration."""
+        if self.protocol == "direct":
+            return {"type": "direct", "tag": tag}
         cfg = {"type": self.protocol, "tag": tag, "server": self.server, "server_port": self.port}
         # Merge protocol-specific attributes
         for k, v in self.raw_config.items():
             if k not in ("name", "server", "port"):
                 cfg[k] = v
         return cfg
+
+    @classmethod
+    def direct(cls, name: str = "Direct (gateway-managed)") -> "ProxyNode":
+        """A passthrough node: egress via the host, still behind the block rules."""
+        return cls(name=name, protocol="direct", server="", port=0, raw_config={})
+
+    @classmethod
+    def from_proxy_url(cls, url: str, name: str = "Explicit Proxy") -> "ProxyNode":
+        """Turn an operator-supplied proxy URL into a Sing-box outbound node.
+
+        Chaining the explicit proxy behind the gateway's own inbound keeps the
+        telemetry block rules on every account, including ones whose egress is
+        an external proxy the gateway does not control.
+        """
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        if scheme == "https":
+            protocol, default_port = "http", 443
+        elif scheme == "http":
+            protocol, default_port = "http", 80
+        elif scheme in ("socks", "socks5", "socks5h"):
+            protocol, default_port = "socks", 1080
+        else:
+            raise ValueError("Unsupported explicit proxy scheme")
+        if not parsed.hostname:
+            raise ValueError("Explicit proxy URL has no host")
+        port = parsed.port or default_port
+        raw: Dict[str, Any] = {"server": parsed.hostname, "port": port}
+        if parsed.username is not None:
+            raw["username"] = urllib.parse.unquote(parsed.username)
+        if parsed.password is not None:
+            raw["password"] = urllib.parse.unquote(parsed.password)
+        if scheme == "https":
+            raw["tls"] = {"enabled": True}
+        return cls(name=name, protocol=protocol, server=parsed.hostname,
+                   port=port, raw_config=raw)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -462,10 +507,19 @@ class ProxyManager:
         Builds a complete Sing-box configuration file.
         Creates one mixed inbound (HTTP/SOCKS5) per account, strictly routed to its paired outbound.
         account_bindings: list of {"port": 20001, "node": ProxyNode}
+
+        The telemetry block rule is always first: sing-box evaluates route
+        rules in order, so PostHog egress is refused for every inbound before
+        any account's outbound is considered. The config uses the legacy
+        outbound-field dialect because the container pins sing-box 1.10,
+        which rejects the newer rule-action form.
         """
         inbounds = []
-        outbounds = []
-        rules = []
+        outbounds = [{"type": "block", "tag": TELEMETRY_BLOCK_OUTBOUND_TAG}]
+        rules = [{
+            "domain_suffix": list(TELEMETRY_BLOCK_DOMAIN_SUFFIXES),
+            "outbound": TELEMETRY_BLOCK_OUTBOUND_TAG,
+        }]
 
         self._pending_inbounds.clear()
         endpoint = LocalProxyEndpoint.from_environment()

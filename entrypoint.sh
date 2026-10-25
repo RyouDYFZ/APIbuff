@@ -22,17 +22,17 @@ else:
     print("No upstream token supplied; existing login files are preserved.")
 PY_CREDENTIALS
 
-# 2. Fail closed unless the image carries a genuine private CLI build. The
-#    check verifies the embedded PostHog opt-out patch plus its build receipt;
-#    a receipt generated for an official binary is rejected here, so workers
-#    can never run unverified telemetry-bearing code.
+# 2. Fail closed unless the image carries the pinned official CLI. Workers
+#    never run unverified code: the binary's SHA-256 must match the committed
+#    registry, and telemetry is refused by the gateway proxy rather than by
+#    modifying the executable.
 python3 - <<'PY_VERIFY'
 import os
-from app.cli_build import verify_private_cli
+from app.cli_build import verify_official_cli
 
-binary = os.environ.get("FREEBUFF_BIN", "/opt/freebuff/private-cli/freebuff")
-verify_private_cli(binary)
-print(f"Verified private Freebuff CLI build (PostHog opt-out embedded): {binary}")
+binary = os.environ.get("FREEBUFF_BIN", "/opt/freebuff/official-cli/freebuff")
+verify_official_cli(binary)
+print(f"Verified pinned official Freebuff CLI: {binary}")
 PY_VERIFY
 
 # 3. Workspace root; each account's worker initializes its own Git repository.

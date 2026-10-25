@@ -44,7 +44,7 @@ from .process_view import RESTORE_SHIM_PATH
 from .git_privacy import prepare_git_privacy_bin
 from .hardware_privacy import build_worker_command
 from .lifecycle import ensure_file_descriptor_limit
-from .jitter import KeystrokeJitterSimulator, JitterConfig, JitterMetrics, write_all
+from .jitter import KeystrokeJitterSimulator, JitterConfig, JitterMetrics, write_all, sleep_jittered
 from .credentials import account_config_dir, write_cli_credentials
 from .response_reader import TranscriptReader, current_response, read_log_records, check_log_error
 from .exceptions import (
@@ -428,25 +428,35 @@ class FreebuffWorker:
                 self.ready_event.set()
 
             # Check for takeover modal prompt
-            if TAKEOVER_AUTO_CONFIRM:
-                if b"take over" in text_lower or b"takeover" in text_lower:
-                    now = time.monotonic()
-                    if now - self._last_takeover_time < TAKEOVER_COOLDOWN_SECONDS:
-                        if not self._takeover_scheduled:
-                            logger.warning(
-                                "Repeated takeover dialog within cooldown window (%.1fs < %ds) for account '%s'. "
-                                "Refusing takeover to prevent upstream ping-pong ban.",
-                                now - self._last_takeover_time,
-                                TAKEOVER_COOLDOWN_SECONDS,
-                                self.account_id,
-                            )
-                            self.ready_event.set()
-                    else:
-                        if not self._takeover_scheduled:
-                            self._takeover_scheduled = True
-                            self._last_takeover_time = now
-                            logger.info("Detected takeover dialog. Scheduling cognitive delay before confirming...")
-                            self._takeover_task = asyncio.create_task(self._delayed_takeover_confirm())
+            is_takeover_prompt = (
+                b"enter: take over" in text_lower
+                or b"take over that session" in text_lower
+                or b"take over to move" in text_lower
+                or b"take over to stop" in text_lower
+                or b"take over?" in text_lower
+                or b"do you want to take over" in text_lower
+            ) and not (
+                b"this session was taken over elsewhere" in text_lower
+                or b"taken over by another instance" in text_lower
+            )
+            if TAKEOVER_AUTO_CONFIRM and is_takeover_prompt:
+                now = time.monotonic()
+                if now - self._last_takeover_time < TAKEOVER_COOLDOWN_SECONDS:
+                    if not self._takeover_scheduled:
+                        logger.warning(
+                            "Repeated takeover dialog within cooldown window (%.1fs < %ds) for account '%s'. "
+                            "Refusing takeover to prevent upstream ping-pong ban.",
+                            now - self._last_takeover_time,
+                            TAKEOVER_COOLDOWN_SECONDS,
+                            self.account_id,
+                        )
+                        self.ready_event.set()
+                else:
+                    if not self._takeover_scheduled:
+                        self._takeover_scheduled = True
+                        self._last_takeover_time = now
+                        logger.info("Detected takeover dialog. Scheduling cognitive delay before confirming...")
+                        self._takeover_task = asyncio.create_task(self._delayed_takeover_confirm())
 
             # Check for admission confirmation modal (model change, wallet hour deduction, retry)
             if ADMISSION_AUTO_CONFIRM:
@@ -460,6 +470,7 @@ class FreebuffWorker:
                             self._admission_retry_count += 1
                             if self._admission_retry_count > 2:
                                 logger.warning("Admission retry limit reached; not auto-retrying.")
+                                self.ready_event.set()
                             else:
                                 self._admission_scheduled = True
                                 logger.info("Detected admission retry dialog. Scheduling cognitive delay before retrying...")
@@ -568,7 +579,7 @@ class FreebuffWorker:
                 self.auth_error_msg = "Freebuff authentication required: token is invalid or expired. Run ./login.sh to authenticate."
                 self.ready_event.set()
                 break
-            await asyncio.sleep(0.05)
+            await sleep_jittered(0.05, variance=0.2)
         self._check_interaction()
         if not self.is_running:
             raise RuntimeError("Freebuff worker exited during startup")
@@ -681,12 +692,20 @@ class FreebuffWorker:
                 error_code="ip_capped",
                 retry_after=30.0,
             )
-        if "this session was taken over elsewhere" in text:
+        if "this session was taken over elsewhere" in text or "taken over by another instance" in text:
             raise FreebuffInteractionRequiredError(
                 "This Freebuff session was taken over elsewhere.",
                 error_code="session_superseded",
             )
-        if ("take over" in text or "takeover" in text):
+        is_takeover_prompt = (
+            "enter: take over" in text
+            or "take over that session" in text
+            or "take over to move" in text
+            or "take over to stop" in text
+            or "take over?" in text
+            or "do you want to take over" in text
+        )
+        if is_takeover_prompt:
             if not TAKEOVER_AUTO_CONFIRM:
                 raise FreebuffInteractionRequiredError("CLI session takeover requires explicit user action.")
             now = time.monotonic()
@@ -696,6 +715,11 @@ class FreebuffWorker:
                     "Another active client may be using this account.",
                     error_code="takeover_cooldown",
                 )
+        if "enter: retry" in text and self._admission_retry_count > 2:
+            raise FreebuffInteractionRequiredError(
+                "Admission retry limit reached; manual intervention required.",
+                error_code="admission_retry_exhausted",
+            )
         if ("confirm and send" in text or "enter: confirm" in text):
             if not ADMISSION_AUTO_CONFIRM:
                 raise FreebuffInteractionRequiredError("CLI model admission requires explicit user confirmation.")
@@ -810,10 +834,10 @@ class FreebuffWorker:
                     )
                     prompt_submitted = True
                     continue
-                await asyncio.sleep(0.15)
+                await sleep_jittered(0.15, variance=0.2)
                 continue
             if not directory:
-                await asyncio.sleep(0.15)
+                await sleep_jittered(0.15, variance=0.2)
                 continue
             if reset_context and directory in existing:
                 if directory == before:
@@ -823,10 +847,10 @@ class FreebuffWorker:
                     positions[directory] = position
                     for record in records:
                         check_log_error(record)
-                await asyncio.sleep(0.15)
+                await sleep_jittered(0.15, variance=0.2)
                 continue
             if not reset_context and directory in existing and directory != before:
-                await asyncio.sleep(0.15)
+                await sleep_jittered(0.15, variance=0.2)
                 continue
             position, records = await asyncio.to_thread(
                 read_log_records, os.path.join(directory, "log.jsonl"), positions.get(directory, 0)
@@ -881,7 +905,7 @@ class FreebuffWorker:
                             "chat_dir": directory,
                             "message_id": response["id"],
                             "jitter_metrics": self.last_jitter_metrics.to_dict()}
-            await asyncio.sleep(0.15)
+            await sleep_jittered(0.15, variance=0.2)
 
     async def stop(self):
         """Close the PTY even when a broken supervisor fails to acknowledge exit."""

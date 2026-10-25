@@ -385,7 +385,7 @@ class MultiAccountWorkerPool:
             acc.cooldown_until = 0
             acc.status = TERMINAL_ACCOUNT_STATUS[status]
         else:
-            acc.mark_cooldown(TRANSIENT_COOLDOWN_SECONDS, str(error))
+            acc.mark_cooldown(TRANSIENT_COOLDOWN_SECONDS, str(error), jitter=True)
 
     @staticmethod
     async def _stop_failed_worker(worker):

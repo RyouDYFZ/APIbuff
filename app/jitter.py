@@ -346,3 +346,26 @@ class KeystrokeJitterSimulator:
 
 # Global default simulator
 default_jitter_simulator = KeystrokeJitterSimulator()
+
+
+def sample_jittered_delay(base_sec: float, variance: float = 0.15, distribution: str = "gaussian") -> float:
+    """
+    Returns a positive jittered delay around base_sec (e.g. ±15%) to prevent
+    clock-aligned machine heartbeat or fixed polling interval signatures.
+    """
+    if base_sec <= 0:
+        return 0.0
+    if distribution == "gaussian":
+        val = random.gauss(base_sec, base_sec * variance)
+    elif distribution == "uniform":
+        val = random.uniform(base_sec * (1.0 - variance), base_sec * (1.0 + variance))
+    else:  # poisson-like / exponential
+        val = random.expovariate(1.0 / base_sec)
+    return max(0.005, val)
+
+
+async def sleep_jittered(base_sec: float, variance: float = 0.15, distribution: str = "gaussian"):
+    """
+    Asynchronously sleeps for a jittered duration around base_sec.
+    """
+    await asyncio.sleep(sample_jittered_delay(base_sec, variance, distribution))

@@ -14,7 +14,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.jitter import JitterConfig, KeystrokeJitterSimulator
+from app.jitter import JitterConfig, KeystrokeJitterSimulator, sample_jittered_delay, sleep_jittered
 from app.response_reader import read_log_records
 
 
@@ -87,6 +87,22 @@ class InputBytesTests(unittest.IsolatedAsyncioTestCase):
         finally:
             os.close(read_fd)
             os.close(write_fd)
+
+    def test_sample_jittered_delay_bounds_and_variability(self):
+        delays = [sample_jittered_delay(1.0, variance=0.2, distribution="gaussian") for _ in range(50)]
+        self.assertTrue(all(d > 0.0 for d in delays))
+        self.assertGreater(len(set(round(d, 4) for d in delays)), 10)
+        self.assertAlmostEqual(sum(delays) / len(delays), 1.0, delta=0.15)
+        # Bounded edge cases
+        self.assertEqual(sample_jittered_delay(0.0), 0.0)
+        self.assertEqual(sample_jittered_delay(-1.0), 0.0)
+
+    async def test_sleep_jittered_completes_within_expected_window(self):
+        start = asyncio.get_running_loop().time()
+        await sleep_jittered(0.02, variance=0.1)
+        elapsed = asyncio.get_running_loop().time() - start
+        self.assertGreaterEqual(elapsed, 0.01)
+        self.assertLess(elapsed, 0.1)
 
 
 class IncrementalLogTests(unittest.TestCase):

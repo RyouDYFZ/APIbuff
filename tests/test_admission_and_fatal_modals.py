@@ -256,6 +256,26 @@ class TestAdmissionAndFatalModals(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Hourly model admission/spend confirmation limit", str(caught.exception))
             self.assertEqual(caught.exception.error_code, "admission_rate_limited")
 
+    async def test_conversational_takeover_does_not_trigger_modal_handler(self):
+        """Conversational mentions of 'takeover' or 'take over' in AI answers/prompts must not trigger modal."""
+        written = []
+
+        async def mock_write_all(fd, data):
+            written.append((fd, data))
+
+        with patch("app.worker.write_all", mock_write_all), \
+             patch("app.worker.TAKEOVER_AUTO_CONFIRM", True), \
+             patch("app.worker.TAKEOVER_COOLDOWN_SECONDS", 600):
+
+            # Simulate conversational output discussing subdomain takeover
+            self.worker._raw_buffer.extend(b"Subdomain takeover happens when DNS points to a deleted resource.\nI will take over the task.\n")
+            self.worker._on_pty_readable()
+            self.assertFalse(self.worker._takeover_scheduled)
+            self.assertEqual(len(written), 0)
+
+            # _check_interaction should NOT raise FreebuffInteractionRequiredError
+            self.worker._check_interaction()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ from .credentials import (
     read_cli_auth_token,
     write_cli_credentials,
 )
+from .jitter import sample_jittered_delay
 
 logger = logging.getLogger("freebuff.accounts")
 
@@ -66,9 +67,7 @@ class AccountState:
         return time.time() < self.cooldown_until
 
     def mark_cooldown(self, seconds: float = 60.0, reason: Optional[str] = None, jitter: bool = False):
-        duration = seconds
-        if jitter and seconds > 0:
-            duration = max(1.0, random.gauss(seconds, seconds * 0.15))
+        duration = sample_jittered_delay(seconds, variance=0.15) if (jitter and seconds > 0) else seconds
         self.cooldown_until = time.time() + duration
         self.status = "cooling"
         self.last_error = reason
